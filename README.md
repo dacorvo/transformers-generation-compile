@@ -91,7 +91,8 @@ wallclock even with no recompile.
 
 1. **Vanilla recompiles on every delta.** Cache key is
    `max_cache_len = max_new_tokens + input_length - 1`
-   ([generation/utils.py:2495](src/transformers/generation/utils.py#L2495));
+   ([generation/utils.py:2538](src/transformers/generation/utils.py#L2538),
+   v5.10.1);
    any growth in either dimension forces a realloc. Both warm-diff
    cells add 21–30 artifacts and 13–26 s of wallclock — the per-turn
    TTFT spike an agent sees.
@@ -125,27 +126,43 @@ wallclock even with no recompile.
 
 ## Worth flagging upstream
 
+All line refs verified against transformers v5.10.1.
+
 1. **`cache_implementation="static"` reallocates on any `max_length`
    growth** and has no documented escape. The DIY workaround conflicts
    with `cache_implementation` at runtime
-   ([generation/utils.py:1822](src/transformers/generation/utils.py#L1822))
-   with no prose explaining why a user might want either. Fixes:
-   (a) doc-note the DIY pattern in the `cache_implementation` docstring,
-   or (b) honor `cache_config["max_cache_len"]` in
-   `_prepare_static_cache` (3-line change).
+   ([generation/utils.py:1866](src/transformers/generation/utils.py#L1866))
+   and the [`cache_implementation` docstring](src/transformers/generation/configuration_utils.py#L163)
+   just lists the choices — no prose on why a user might want DIY.
+   Fixes: (a) doc-note the DIY pattern in the `cache_implementation`
+   docstring; (b) honor `cache_config["max_cache_len"]` in
+   `_prepare_static_cache`
+   ([generation/utils.py:1774](src/transformers/generation/utils.py#L1774))
+   — it already accepts a `cache_config` parameter but only consumes
+   it on the quantized path.
 2. **`CacheLayerMixin.is_initialized` is Dynamo-guarded by object id**
    (mechanism in takeaway #2). Vanilla users can't apply
    `early_initialization()` themselves because the cache is built
-   inside generate(). Fixes, ascending in invasiveness: doc the knob
-   for agentic loops (existing
-   [cache_utils.py:302](src/transformers/cache_utils.py#L302) frames
-   it as export-only); auto-call from `_prepare_static_cache`;
-   replace the bool with a tensor/class-level constant so the guard
-   specializes on value.
-3. **`prefill_chunk_size` is undocumented public API.** Set via
+   inside generate(). The existing docstring at
+   [cache_utils.py:302](src/transformers/cache_utils.py#L302) mentions
+   the knob but tells the user *not* to call it for `compile` —
+   "we internally don't compile the prefill, this is guaranteed to
+   have been called already". That assumption is wrong once
+   `prefill_chunk_size` is set (the chunked-prefill path calls
+   `get_compiled_call()` per chunk). Fixes, ascending in
+   invasiveness: correct the docstring + surface the knob in the
+   chunked-prefill user docs; auto-call from `_prepare_static_cache`;
+   replace the bool with a tensor / class-level constant so the
+   Dynamo guard specializes on value.
+3. **`prefill_chunk_size` is effectively undocumented.** Set via
    `kwargs.pop` at
-   [configuration_utils.py:465](src/transformers/generation/configuration_utils.py#L465);
-   absent from the class docstring.
+   [configuration_utils.py:464](src/transformers/generation/configuration_utils.py#L464);
+   absent from the `GenerationConfig` class docstring; absent from
+   `docs/source/en/kv_cache.md` and `optimization_overview.md` (which
+   mentions chunked prefill only in the `generate_batch` /
+   continuous-batching context, not single-request `generate()`).
+   The one user-facing mention is a code snippet in
+   `docs/source/en/model_doc/llama4.md:237` with no exposition.
 4. **No bucket-padding helper.** Recompile-free dispatch needs
    exact-shape input; every team rolls its own pad-to-next-bucket loop.
 
