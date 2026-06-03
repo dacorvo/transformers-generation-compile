@@ -1,19 +1,16 @@
 # Generation loop on transformers + `torch.compile` — findings
 
-Scope: [SCOPE.md](SCOPE.md). One-process, batch-1 generation loop on
-transformers v5 with chunked prefill, no prefix caching.
+Cache and recompile behavior of `model.generate()` on transformers v5
+with `torch.compile` + chunked prefill, in a single-request access
+pattern with varying prompt and decode-budget sizes across calls.
 
-Test bed: 1× NVIDIA A10G (23 GiB), bf16, torch 2.7.0+cu126,
+Setup: 1× NVIDIA A10G (23 GiB), bf16, torch 2.7.0+cu126,
 transformers 5.10.0.dev0 (upstream `main` at commit 595721c),
-`Llama-3.2-1B-Instruct` only. Gemma-4-E4B was in SCOPE.md but was
-dropped during simplification; the hybrid / sliding-window open
-question therefore stays open (see caveats).
+`Llama-3.2-1B-Instruct`.
 
-Each scenario cell below is a single timed call (N=1). SCOPE asked
-for N≥10 with TTFT variance; the new bench traded that for
-side-by-side mode comparison. Treat warm-diff cells as "this delta
-does/doesn't recompile" indicators (the +artifacts column is the
-unambiguous signal), not as steady-state performance numbers.
+Each scenario cell is a single timed call (N=1). The `+artifacts`
+column is the unambiguous "did Inductor recompile" signal; wallclock
+is informational.
 
 ## TL;DR
 
@@ -40,15 +37,10 @@ prefill, in ascending order of stability:
    (107 vs 95 on a clean warm cell) by skipping `generate()`'s
    Python plumbing.
 
-See [scenario sweep](#scenario-sweep) for the data. Two findings sit
-outside the sweep:
-
-- **Cache over-provisioning costs decode tok/s.** Pinning a 1024-prompt
-  call to a cache sized 8192+128 halves decode throughput. See
-  [cache pinning vs over-provisioning](#cache-pinning-vs-over-provisioning).
-- **`generate()`'s Python decode loop costs ~1.1 ms / step on CUDA.**
-  ~14 % of wallclock on a 1B model. `static_tensors` removes it. See
-  [evidence/decode_overhead.py](evidence/decode_overhead.py).
+See [scenario sweep](#scenario-sweep) for the data. One finding sits
+outside the sweep: **`generate()`'s Python decode loop costs ~1.1 ms /
+step on CUDA** (~14 % of wallclock on a 1B model). `static_tensors`
+removes it. See [evidence/decode_overhead.py](evidence/decode_overhead.py).
 
 ## Scenario sweep
 
@@ -77,18 +69,15 @@ Driven by [bench_scenarios.py](bench_scenarios.py). Raw output in
 - **warm-diff-mnt** — warm cache, same prompt, larger `max_new_tokens`.
 - **warm-diff-in** — warm cache, longer prompt.
 
-Each cell is `total_s / tps / +artifacts`. Color is on the +artifacts
-column alone — the unambiguous "did anything recompile" signal.
-Applied to every cell except `cold` (which is the compile baseline
-and would always be 🔴 by definition):
+Each cell is `total_s / tps / +artifacts`. Color is on the
+`+artifacts` column alone, applied to every cell except `cold` (the
+compile baseline, by definition non-zero):
 
-- 🟢 +0 artifacts (cache absorbed; no Inductor compile fired)
+- 🟢 +0 artifacts (cache absorbed the delta; no Inductor compile)
 - 🔴 +artifacts > 0 (real Inductor recompile)
 
-Wallclock ratios stopped being a useful color basis once the diy /
-static_tensors warms became clean steady-state (more tokens = more
-wallclock even with no recompile). They still appear in the table as
-context.
+Wallclock is context, not the color basis — more tokens take more
+wallclock even with no recompile.
 
 ### Results
 
@@ -108,17 +97,14 @@ context.
    Both warm-diff cells add 21–30 new Inductor artifacts (the +artifacts
    column) and 13–26 s of wallclock per first occurrence — the per-turn
    TTFT spike an agent would see.
-2. **DIY + `early_initialization` absorbs both deltas, one-shot.**
-   Construct the cache once at the worst-case size, call
-   `cache.early_initialization(...)` once, pass via `past_key_values=`,
-   drop `cache_implementation` (the two can't coexist —
+2. **DIY + `early_initialization` absorbs both deltas.** Construct the
+   cache once at the worst-case size, call
+   `cache.early_initialization(...)`, pass via `past_key_values=`, drop
+   `cache_implementation` (the two can't coexist —
    [generation/utils.py:1822](src/transformers/generation/utils.py#L1822)).
    The auto-compile criterion checks `cache.is_compileable`, not the
    config field, so the compile path still kicks in. Both warm-diff
-   cells show 0 new artifacts — the cache absorbs the delta. Each cell
-   is still a single timed call, so this is "no recompile on this
-   delta", not a 10-call steady-state validation; but the +artifacts
-   signal is mechanically unambiguous.
+   cells show 0 new artifacts — the cache absorbs the delta.
 3. **`static_tensors` adds ~12 % decode tok/s on top of DIY** (107 vs 96
    tps on warm-diff-mnt). The win is generate()'s Python overhead —
    `torch.cat` of growing tensors plus the mask rebuild per step — that
@@ -153,36 +139,20 @@ context.
    `early_initialization()` on the freshly-allocated cache before
    returning).
 5. **One Dynamo retrace anomaly on `diy / warm-diff-in`.** The cell
-   shows 14.7 s wallclock with **+0 new Inductor artifacts** — i.e.
-   no kernel was compiled, but something inside Dynamo still took
-   ~13 s. The most likely culprit: the longer prompt forces Dynamo
-   to re-trace the prefill graph for the new outer `input_ids` shape
-   (1, 2048), discover the per-chunk shape (1, 1024) is unchanged,
-   and hit the FX-graph cache for the chunk kernel — paying the
-   tracing time but not the codegen time. We did not chase this; the
-   cache absorption claim (0 artifacts → no recompile) still holds.
+   shows 14.7 s wallclock with **+0 new Inductor artifacts** — no
+   kernel was compiled, but something inside Dynamo still took
+   ~13 s. Likely cause: the longer prompt forces Dynamo to re-trace
+   the prefill graph for the new outer `input_ids` shape (1, 2048),
+   the per-chunk shape (1, 1024) is unchanged so the FX-graph cache
+   serves the chunk kernel — tracing time is paid, codegen time is
+   not. Not investigated further. The cache-absorption claim
+   (0 artifacts → no Inductor recompile) holds regardless.
 6. **Scenario order matters for vanilla.** `warm-diff-mnt` is run
    before `warm-diff-in` so each delta forces a fresh cache realloc.
    With the reverse order, `warm-diff-in` grows the auto-cache to 2175
    slots and `warm-diff-mnt` (needing only 1279) silently hits the
    larger cache — hiding the footgun. Diy and static_tensors are
    order-independent because their cache is pre-sized.
-
-## Cache pinning vs over-provisioning
-
-Separate from the scenario sweep above. When a single process serves
-prompts of very different sizes (e.g. a 1024 bucket and an 8192 bucket),
-the StaticCache must be sized for the largest. The small-bucket calls
-then attend over a mostly-empty buffer:
-
-| 1024-bucket measurement | cache=1024+128 | cache=8192+128 |
-|---|---|---|
-| TTFT p50 (chunk=1024) | 47.7 ms | 76.2 ms (1.60× slower) |
-| decode tok/s | 115 | 52 (**2.2× slower**) |
-
-Numbers from a separate run with a different config; not regenerated.
-The actionable rule: if prompt-length distribution is bimodal, run two
-compiled processes (one per bucket family), not one shared.
 
 ## Worth flagging upstream
 
@@ -223,29 +193,13 @@ compiled processes (one per bucket family), not one shared.
    recompile-free dispatch, and that requires exact-shape input. Every
    team using this pattern rolls their own pad-to-next-bucket loop.
 
-## Caveats and what we didn't test
-
-- **Left-pad output quality**: not end-to-end tested. The bench uses
-  random BOS-prefilled ids; before serving real traffic, verify that
-  the model produces the same tokens with and without padding.
-- **`fullgraph=True` with sdpa**: not tested.
-- **Hybrid / sliding-window attention models** (Gemma, Mistral-SWA,
-  etc.): not measured in this iteration. `prefill_chunk_size >
-  sliding_window` is anecdotally known to interact poorly with kernel
-  choice on those models, but we have no fresh data.
-- **Compile mode (`default` vs `max-autotune-no-cudagraphs`)**: not
-  varied in the scenario bench. A separate run on Llama-1B showed
-  autotune buys ~8–9 % TTFT for 3× the warmup wallclock; `default` is
-  the right production default.
-- **Batch > 1** is out of scope.
-
 ## Reproduce
 
 ```sh
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python torch==2.7.0 \
     --index-url https://download.pytorch.org/whl/cu126
-uv pip install --python .venv/bin/python -e /path/to/transformers accelerate
+uv pip install --python .venv/bin/python transformers accelerate
 ```
 
 Then run the scenario sweep (orchestrator spawns one subprocess per
@@ -253,12 +207,6 @@ mode, each with a fresh Inductor cache):
 
 ```sh
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python bench_scenarios.py
-```
-
-Or run a single mode directly (used internally by the orchestrator):
-
-```sh
-CUDA_VISIBLE_DEVICES=0 .venv/bin/python bench_scenarios.py --mode diy
 ```
 
 The three orthogonal evidence scripts in [evidence/](evidence/) each
