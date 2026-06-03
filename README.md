@@ -138,7 +138,7 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python bench.py \
     --model-id meta-llama/Llama-3.2-1B-Instruct --mode default \
     --input-lens 1024 8192 --chunk-sizes 512 1024 \
     --steady-calls 10 --decode-sanity-tokens 128 \
-    --cache-root /tmp/inductor-bench --run-tag llama-default
+    --cache-root /tmp/inductor-bench --run-tag llama
 ```
 
 Every script reads its own purpose from the first ten lines of its

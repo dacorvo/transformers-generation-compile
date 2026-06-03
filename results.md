@@ -61,5 +61,5 @@ Per cell, each `logs/<run>.json` carries:
 
 ```sh
 jq '.cells[] | {input_len, chunk_size, ttft_s_median, ss_artifacts_delta}' \
-   logs/llama-default.json
+   logs/llama.json
 ```
