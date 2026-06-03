@@ -1,19 +1,22 @@
-"""Sweep transformers generate() under torch.compile + chunked prefill.
+"""Warmup + steady-state sweep for one (model, mode) configuration.
 
-One invocation = one (model, mode) experiment. Within it we warm and
-measure every (input_len bucket, chunk_size) cell. JSON results are
-emitted to stdout (one line per cell + a final summary line).
+WHAT: phase A runs one full generate() per (input_len × chunk_size)
+cell in largest-bucket-first order. Phase B measures TTFT × N (via a
+StoppingCriteria truncating to 1 new token) plus one full-decode
+call per cell. Snapshots torch._dynamo.utils.counters and the
+Inductor cache directory around each cell to detect silent recompiles.
+JSON summary emitted to stdout.
 
-Key invariants we enforce to avoid silent recompiles:
-- The static cache is sized once, for the LARGEST input_len + decode
-  budget we plan to use. We warm the biggest bucket first so the
-  `StaticCache.max_cache_len` is fixed for the rest of the run.
-- All generate() calls use the SAME `max_new_tokens` (the decode
-  budget) so the cache size never grows mid-experiment. To get a
-  cheap TTFT proxy without paying for a full decode, we additionally
-  measure prefill-only via a StoppingCriteria that fires after the
-  first new token. (max_new_tokens stays large; the StoppingCriteria
-  just truncates the loop, leaving the cache size untouched.)
+WHY:  the harness pins two things across every generate() call —
+`max_new_tokens` (the decode budget) and the input_len bucket
+warming order (biggest first) — so the StaticCache buffer never
+grows mid-run. That keeps shapes stable, so any recompile we see
+during steady state is a real surprise, not a setup artifact.
+
+RESULT: per-cell warmup/TTFT/decode/recompile numbers. See
+logs/<model>-<mode>.json + results.md.
+
+RUN: see README.md "Reproduce".
 """
 from __future__ import annotations
 

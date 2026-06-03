@@ -1,22 +1,29 @@
-"""Demonstrate the silent-recompile bomb when max_new_tokens grows.
+"""Show that growing `max_new_tokens` reallocates the StaticCache and
+forces a full Inductor recompile.
 
-`generate()` derives `max_cache_length = generation_config.max_length - 1`
-(see transformers/generation/utils.py:2495) and `max_length` is itself
-`max_new_tokens + input_ids_length` (line 1627). When a subsequent
-generate() call asks for a bigger `max_new_tokens` than any seen so far,
-the StaticCache is reallocated (lines 1749-1770) — which changes the
-shape of the KV tensors fed to the compiled forward and forces a full
-Inductor recompile. In an agent loop where each turn may need a
-different decode budget, this is a TTFT bomb.
+WHAT: 8 generate() calls with `max_new_tokens` stepped 8 → 16 → 32 → 8.
 
-Run me with:
-  CUDA_VISIBLE_DEVICES=0 .venv/bin/python demo_cache_realloc.py
+WHY:  `max_cache_length = generation_config.max_length - 1`
+(transformers/generation/utils.py:2495) and `max_length =
+max_new_tokens + input_ids_length`. Any call whose computed
+`max_cache_length` exceeds anything seen so far reallocates the
+StaticCache (line 1753) → new tensor shape → recompile.
+
+RESULT (A10G, Llama-3.2-1B, mode=default):
+  each new-max value pays 11–19 s of recompile;
+  same-as-before or smaller values stay at ~70 ms / call.
+
+RUN: CUDA_VISIBLE_DEVICES=0 .venv/bin/python evidence/cache_realloc.py
 """
-from __future__ import annotations
-import os, time
-os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/tmp/inductor-demo")
+# ── env (must precede `import torch`) ──
+import os
+CACHE_DIR = "/tmp/inductor-realloc"
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", CACHE_DIR)
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
+# ── imports ──
+import time
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -25,33 +32,34 @@ from transformers.generation.configuration_utils import GenerationConfig, Compil
 torch.set_grad_enabled(False)
 torch.set_float32_matmul_precision("high")
 
+# ── config ──
 MID = "meta-llama/Llama-3.2-1B-Instruct"
 DEVICE = torch.device("cuda:0")
+PROMPT_LEN = 256
 
-model = AutoModelForCausalLM.from_pretrained(MID, dtype=torch.bfloat16, attn_implementation="sdpa").to(DEVICE)
-model.eval()
+# ── setup ──
+model = AutoModelForCausalLM.from_pretrained(
+    MID, dtype=torch.bfloat16, attn_implementation="sdpa",
+).to(DEVICE).eval()
 tok = AutoTokenizer.from_pretrained(MID)
-
-ids = tok("Hello, this is a benchmark of " * 30, return_tensors="pt").input_ids[:, :256].to(DEVICE)
+ids = tok("Hello, this is a benchmark of " * 30, return_tensors="pt").input_ids[:, :PROMPT_LEN].to(DEVICE)
 mask = torch.ones_like(ids)
 
-
+# ── helpers ──
 def time_generate(max_new_tokens: int) -> float:
-    gc = GenerationConfig(
+    cfg = GenerationConfig(
         do_sample=False,
         cache_implementation="static",
         compile_config=CompileConfig(mode="default", fullgraph=False),
-        max_new_tokens=max_new_tokens,
-        min_new_tokens=max_new_tokens,
+        max_new_tokens=max_new_tokens, min_new_tokens=max_new_tokens,
         pad_token_id=tok.eos_token_id,
     )
-    torch.cuda.synchronize()
-    t = time.perf_counter()
-    model.generate(input_ids=ids, attention_mask=mask, generation_config=gc)
+    torch.cuda.synchronize(); t = time.perf_counter()
+    model.generate(input_ids=ids, attention_mask=mask, generation_config=cfg)
     torch.cuda.synchronize()
     return time.perf_counter() - t
 
-
+# ── main ──
 print("== Scenario A: hold max_new_tokens constant ==")
 print(f"  call 1 (max_new=8, cold):      {time_generate(8):6.2f}s   <-- pays full compile")
 print(f"  call 2 (max_new=8):            {time_generate(8):6.2f}s")
