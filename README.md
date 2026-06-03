@@ -5,15 +5,13 @@ transformers v5 with `cache_implementation="static"` + chunked
 prefill, no prefix caching.
 
 Test bed: 1× NVIDIA A10G (23 GiB), bf16, torch 2.7.0+cu126,
-transformers 5.8.0.dev0 (local editable), `Llama-3.2-1B-Instruct` and
-`google/gemma-4-E4B-it`.
+transformers 5.10.0.dev0 (upstream `main`), `Llama-3.2-1B-Instruct`.
 
 ## TL;DR
 
-Recompile-free, low-variance steady-state TTFT (p99/p50 ≤ 1.02 on
-Llama, ≤ 1.006 on Gemma) is achievable today, but only if four
-behaviors are baked into the generate() calls. None of them surface
-in the public knobs.
+Recompile-free, low-variance steady-state TTFT (p99/p50 ≤ 1.02) is
+achievable today, but only if four behaviors are baked into the
+generate() calls. None of them surface in the public knobs.
 
 1. **Pad inputs to a fixed bucket** that is a clean multiple of
    `prefill_chunk_size`. Otherwise the tail chunk has a unique shape
@@ -29,12 +27,8 @@ in the public knobs.
 4. **Use `mode="default"`, not the library default `"reduce-overhead"`.**
    `reduce-overhead` uses CUDA Graphs, which conflict with chunked
    prefill. Among the two CUDA-Graphs-free options, `default` and
-   `max-autotune-no-cudagraphs`, autotune buys 8–9 % TTFT on Llama
-   and ≤ 1.4 % on Gemma at 1.5–3× the warmup cost.
-
-For hybrid-attention models a fifth rule applies: **`prefill_chunk_size
-≤ sliding_window`**. Cross by 2× on Gemma-4-E4B and you eat a 30 %
-TTFT regression at the 8K bucket.
+   `max-autotune-no-cudagraphs` differ by 8–9 % TTFT — autotune wins,
+   but at 3× the warmup cost.
 
 Separately: generate()'s Python decode loop carries ~1.1 ms/step of
 overhead from growing `input_ids`/`attention_mask`/`position_ids` —
@@ -53,28 +47,28 @@ proportionally as model size grows.
 | 2-fix | DIY-StaticCache (size once, pass as `past_key_values=`, drop `cache_implementation`) makes `max_new_tokens` free across calls. | [evidence/cache_realloc_fix.py](evidence/cache_realloc_fix.py) |
 | – | Cross-bucket dispatch is genuinely recompile-free after warmup: 20 random-bucket calls, 0 new artifacts, p99/p50 = 1.001. | [evidence/interleave_buckets.py](evidence/interleave_buckets.py) |
 
-### Cheap wins (Llama-1B unless noted)
+### Cheap wins
 
 1. **Warm largest bucket first.** With this order the four warmup
    cells add 76 + 29 + 0 + 0 = 105 Inductor artifacts; the small-bucket
    cells reuse the prefill kernels compiled at the large-bucket cache
    size. Reverse-order warmup is inferred to ~double the artifacts;
    we didn't quantify.
-2. **`prefill_chunk_size ≤ sliding_window` is mandatory on hybrid
-   attention.** On Llama (no sliding window) chunk=1024 beats
-   chunk=512 by ~13 %. On Gemma-4-E4B (sliding_window=512, 35/42
-   layers sliding), chunk=1024 loses by 30 % at the 8K bucket because
-   per-chunk attention becomes "rolling" inside the chunk and
-   Inductor produces 6 artifacts instead of 401.
+2. **`prefill_chunk_size=1024` beats `chunk_size=512` by ~13 %** on
+   both buckets (76 vs 87 ms at 1024, 594 vs 676 ms at 8192). Fewer
+   kernel launches, no apparent downside at A10G memory levels.
+   Caveat: this is a *standard-causal-attention* result. Models with
+   sliding-window attention can flip the sign when `chunk_size` is
+   larger than the window — we did not measure this here.
 3. **Cache-pinning has a real decode cost on the small bucket.**
    1024-prompt request with cache pinned at 8192+128 decodes at
    52 tok/s; pinned at 1024+128 it decodes at 115 tok/s — **2.2×
    slowdown** from over-provisioning. If prompt-length distribution is
    bimodal, run two compiled processes, not one shared.
 4. **`mode="default"` is the production choice.** Autotune wins
-   8–9 % TTFT on Llama for 3× the warmup; on Gemma it wins ≤ 1.4 % at
-   1.5× the warmup, because attention (cuDNN/efficient-SDPA) dominates
-   and isn't autotuned by Inductor.
+   8–9 % TTFT and 5 % decode at 3× the warmup wallclock (91 s vs 270 s
+   for four warmup cells). Worth considering only if the process
+   amortizes warmup over a very long-lived loop.
 5. **The generate()-loop convenience-tensor cost is ~1.1 ms/step on
    CUDA** (~14–17 % of decode wallclock on a 1B model). Not a
    recompile; just `torch.cat` of growing tensors + the rebuild of the
@@ -110,7 +104,11 @@ proportionally as model size grows.
   random BOS-prefilled ids; before serving real traffic, verify that
   the model produces the same tokens with and without padding.
 - **`fullgraph=True` with sdpa**: not tested (`_can_compile_fullgraph`
-  is set on both Llama and Gemma).
+  is set on Llama).
+- **Hybrid / sliding-window attention models** (Gemma, Mistral
+  small-with-SWA, etc.): not measured in this iteration. Anecdotally,
+  `prefill_chunk_size > sliding_window` is known to interact poorly
+  with kernel choice on those models, but we have no fresh data.
 - **Batch > 1**: out of scope — multi-request batching is
   `generate_batch`'s problem.
 - **Attention-mask shape variation within a fixed bucket**: not
