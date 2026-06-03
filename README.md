@@ -11,9 +11,9 @@ question therefore stays open (see caveats).
 
 Each scenario cell below is a single timed call (N=1). SCOPE asked
 for N≥10 with TTFT variance; the new bench traded that for
-side-by-side mode comparison. Treat the warm-diff rows as "this
-delta does/doesn't recompile" indicators, not as steady-state
-performance numbers.
+side-by-side mode comparison. Treat warm-diff cells as "this delta
+does/doesn't recompile" indicators (the +artifacts column is the
+unambiguous signal), not as steady-state performance numbers.
 
 ## TL;DR
 
@@ -26,16 +26,19 @@ prefill, in ascending order of stability:
    longer prompt costs ~2.7× warm wallclock, a larger `max_new_tokens`
    costs ~1.8×. The auto-allocated StaticCache is the root cause.
 2. **diy** — construct the StaticCache yourself sized for the worst
-   case, pass via `past_key_values=`, and *do not* set
-   `cache_implementation`. On the single call tested per warm-diff
-   cell, no new Inductor artifacts and ratio ≤ 1.0× warm. The
-   provisional recipe.
-3. **static_tensors** — DIY cache *plus* pre-allocate the decode loop's
-   tensors (input_ids, position_ids, cache_position, 4D mask) and call
+   case, call `cache.early_initialization(...)` *once* before the
+   first generate() (otherwise you eat ~13 s on the second call from a
+   Dynamo guard miss on `is_initialized` — see takeaway #4), pass the
+   cache via `past_key_values=`, and *do not* set
+   `cache_implementation`. Both warm-diff cells absorb cleanly:
+   +0 new Inductor artifacts. The provisional recipe.
+3. **static_tensors** — DIY cache (with the same `early_initialization`
+   step) *plus* pre-allocate the decode loop's tensors (input_ids,
+   position_ids, cache_position, 4D mask) and call
    `model.get_compiled_call()` directly with manual argmax sampling.
-   Same cache behavior as DIY in the one-shot test, plus ~12 % higher
-   tok/s on warm-diff-mnt by skipping `generate()`'s Python plumbing
-   (single-call number, single config).
+   Same cache behavior as DIY, plus ~11 % higher decode tok/s
+   (107 vs 95 on a clean warm cell) by skipping `generate()`'s
+   Python plumbing.
 
 See [scenario sweep](#scenario-sweep) for the data. Two findings sit
 outside the sweep:
@@ -74,22 +77,24 @@ Driven by [bench_scenarios.py](bench_scenarios.py). Raw output in
 - **warm-diff-mnt** — warm cache, same prompt, larger `max_new_tokens`.
 - **warm-diff-in** — warm cache, longer prompt.
 
-Each cell is `total_s / tps / +artifacts`. Color rates each warm-diff
-cell against the same mode's warm wallclock. Thresholds are CUDA-tuned
-(Inductor compile is fast enough that even 2× warm is a clearly
-visible TTFT spike, not "partial reuse"):
+Each cell is `total_s / tps / +artifacts`. Color is on the +artifacts
+column alone — the unambiguous "did anything recompile" signal:
 
-- 🟢 ≤ 1.2× warm (essentially a cache hit)
-- 🟡 1.2–1.5× warm (some absorption, but visible)
-- 🔴 > 1.5× warm (effectively a recompile)
+- 🟢 +0 artifacts (cache absorbed the delta cleanly)
+- 🔴 +artifacts > 0 (real Inductor recompile)
+
+Wallclock ratios stopped being a useful color basis once the diy /
+static_tensors warms became clean steady-state (more tokens = more
+wallclock even with no recompile). They still appear in the table as
+context.
 
 ### Results
 
 | mode | cold | warm | warm-diff-mnt | warm-diff-in |
 |---|---|---|---|---|
-| vanilla        | 29.0 s / 4.4 tps / +56 | 14.6 s / 8.8 tps / +18 | 🔴 26.9 s / 9.5 tps / +21  | 🔴 39.8 s / 3.2 tps / +30 |
-| diy            | 29.2 s / 4.4 tps / +56 | 15.1 s / 8.5 tps / +18 | 🟢 2.7 s / 96.2 tps / +0   | 🟢 14.6 s / 8.8 tps / +0  |
-| static_tensors | 26.9 s / 4.8 tps / +56 | 14.0 s / 9.1 tps / +20 | 🟢 2.4 s / 107.2 tps / +0  | 🟢 13.5 s / 9.5 tps / +0  |
+| vanilla        | 29.7 s / 4.3 tps / +56 | 14.9 s / 8.6 tps / +18 | 🔴 27.6 s / 9.3 tps / +21  | 🔴 40.8 s / 3.1 tps / +30 |
+| diy            | 28.9 s / 4.4 tps / +54 |  1.4 s / 95.0 tps / +0 | 🟢 2.6 s / 96.6 tps / +0   | 🟢 14.7 s / 8.7 tps / +0  |
+| static_tensors | 26.6 s / 4.8 tps / +54 |  1.2 s / 105.1 tps / +0 | 🟢 2.4 s / 107.2 tps / +0 | 🟢 13.6 s / 9.4 tps / +0  |
 
 ### Takeaways
 
@@ -98,19 +103,20 @@ visible TTFT spike, not "partial reuse"):
    as its key
    ([generation/utils.py:2495](src/transformers/generation/utils.py#L2495))
    — any change in either dimension forces a realloc and recompile.
-   warm-diff-mnt sits at 1.8× warm, warm-diff-in at 2.7× warm — both
-   firmly 🔴 by CUDA standards. The absolute cost is 12–25 s per first
-   occurrence (vs minutes on Neuron), and that's the per-turn TTFT
-   spike an agent would see.
-2. **DIY absorbs both deltas in the one-shot test.** Construct the
-   cache once at the worst-case size, pass via `past_key_values=`,
+   Both warm-diff cells add 21–30 new Inductor artifacts (the +artifacts
+   column) and 13–26 s of wallclock per first occurrence — the per-turn
+   TTFT spike an agent would see.
+2. **DIY + `early_initialization` absorbs both deltas, one-shot.**
+   Construct the cache once at the worst-case size, call
+   `cache.early_initialization(...)` once, pass via `past_key_values=`,
    drop `cache_implementation` (the two can't coexist —
    [generation/utils.py:1822](src/transformers/generation/utils.py#L1822)).
    The auto-compile criterion checks `cache.is_compileable`, not the
-   config field, so the compile path still kicks in. The bench shows
-   0 new artifacts and ≤ 1.0× warm wallclock on both warm-diff cells
-   — but each cell is a single timed call, so this is "no recompile
-   on this delta" rather than a 10-call steady-state validation.
+   config field, so the compile path still kicks in. Both warm-diff
+   cells show 0 new artifacts — the cache absorbs the delta. Each cell
+   is still a single timed call, so this is "no recompile on this
+   delta", not a 10-call steady-state validation; but the +artifacts
+   signal is mechanically unambiguous.
 3. **`static_tensors` adds ~12 % decode tok/s on top of DIY** (107 vs 96
    tps on warm-diff-mnt). The win is generate()'s Python overhead —
    `torch.cat` of growing tensors plus the mask rebuild per step — that
@@ -118,12 +124,42 @@ visible TTFT spike, not "partial reuse"):
    [evidence/decode_overhead.py](evidence/decode_overhead.py) for the
    isolated microbenchmark; the relative win shrinks at larger model
    sizes where decode is bandwidth-bound.
-4. **The first warm call adds ~18 artifacts in every mode.** A lazy
-   late compile inside `generate()` fires on the second call after
-   cold. It costs ~10–12 s wallclock and is mode-independent, so it
-   doesn't affect the diff measurements — they're rated against the
-   warm wallclock, which already includes the lazy cost.
-5. **Scenario order matters for vanilla.** `warm-diff-mnt` is run
+4. **The "warm" recompile in vanilla is a Dynamo guard miss on
+   `is_initialized`, and `cache.early_initialization()` fixes it.**
+   The StaticCache layer's `is_initialized` flag is a plain Python
+   bool that flips False → True during the first prefill's
+   `lazy_initialization` ([cache_utils.py:336](src/transformers/cache_utils.py#L336)).
+   Dynamo's `___check_obj_id` guard captures the *object identity* of
+   the False at trace time and fires on the second call because True
+   is a different Python object — forcing the prefill graph to
+   re-trace. `cache.reset()` doesn't restore the original False
+   object. Cost: ~18 redundant Inductor artifacts and ~13 s wallclock
+   on every second-call-after-cold transition.
+
+   The fix is documented at [cache_utils.py:302](src/transformers/cache_utils.py#L302):
+   call `cache.early_initialization(batch_size, num_heads, head_dim,
+   dtype, device)` once before the first generate(). The flip then
+   happens before Dynamo traces; subsequent calls hit the cache
+   cleanly. In our bench, applying this to diy and static_tensors
+   collapses warm from ~15 s / +18 artifacts to ~1.4 s / +0 artifacts.
+
+   **Vanilla can't use this fix** — `cache_implementation="static"`
+   makes generate() construct the cache internally, so the user has
+   no handle on it before tracing. That's a second strike against
+   vanilla beyond the cache realloc footgun. Closing this would need
+   an upstream change in `_prepare_static_cache` (call
+   `early_initialization()` on the freshly-allocated cache before
+   returning).
+5. **One Dynamo retrace anomaly on `diy / warm-diff-in`.** The cell
+   shows 14.7 s wallclock with **+0 new Inductor artifacts** — i.e.
+   no kernel was compiled, but something inside Dynamo still took
+   ~13 s. The most likely culprit: the longer prompt forces Dynamo
+   to re-trace the prefill graph for the new outer `input_ids` shape
+   (1, 2048), discover the per-chunk shape (1, 1024) is unchanged,
+   and hit the FX-graph cache for the chunk kernel — paying the
+   tracing time but not the codegen time. We did not chase this; the
+   cache absorption claim (0 artifacts → no recompile) still holds.
+6. **Scenario order matters for vanilla.** `warm-diff-mnt` is run
    before `warm-diff-in` so each delta forces a fresh cache realloc.
    With the reverse order, `warm-diff-in` grows the auto-cache to 2175
    slots and `warm-diff-mnt` (needing only 1279) silently hits the
@@ -158,11 +194,30 @@ compiled processes (one per bucket family), not one shared.
    `cache_implementation` docstring entry, or (b) honor
    `cache_config["max_cache_len"]` in `_prepare_static_cache` (3-line
    change).
-2. **`prefill_chunk_size` is undocumented public API.** Defined via
+2. **`CacheLayerMixin.is_initialized` triggers a Dynamo recompile on
+   the second call** (takeaway #4). The flag is a plain Python bool
+   that flips False → True inside the compiled forward, and Dynamo
+   guards on it by object id via `___check_obj_id`. Result: ~18
+   redundant Inductor artifacts and ~13 s wallclock on every
+   warm-after-cold call until the user calls `early_initialization`.
+   Three possible fixes, increasing in invasiveness:
+   - **Doc**: surface `cache.early_initialization()` as the
+     recommended workaround for agentic loops with chunked prefill,
+     not just for torch.export. The existing docstring at
+     [cache_utils.py:302](src/transformers/cache_utils.py#L302)
+     mentions it but frames it as an export-only knob.
+   - **Auto-call**: have `_prepare_static_cache` call
+     `early_initialization()` on the freshly-allocated cache before
+     returning — closes the gap for `cache_implementation="static"`
+     users too.
+   - **Avoid the guard**: replace the Python bool with a tensor or
+     class-level constant so Dynamo specializes on value, not on
+     mutable object identity. Removes the trap entirely.
+3. **`prefill_chunk_size` is undocumented public API.** Defined via
    `kwargs.pop` at
    [configuration_utils.py:465](src/transformers/generation/configuration_utils.py#L465)
    and absent from the class docstring.
-3. **No bucket-padding helper.** The whole point of buckets is
+4. **No bucket-padding helper.** The whole point of buckets is
    recompile-free dispatch, and that requires exact-shape input. Every
    team using this pattern rolls their own pad-to-next-bucket loop.
 

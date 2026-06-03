@@ -174,10 +174,19 @@ def _make_diy_runner(model, tok, device):
     from transformers.generation.configuration_utils import GenerationConfig, CompileConfig
 
     cache = StaticCache(config=model.config, max_cache_len=DIY_MAX_CACHE_LEN)
-    for layer in cache.layers:
-        if hasattr(layer, "keys") and isinstance(layer.keys, torch.Tensor):
-            layer.keys = layer.keys.to(device)
-            layer.values = layer.values.to(device)
+    # Pre-fire the cache layers' `is_initialized` flag and allocate the K/V
+    # tensors BEFORE Dynamo traces. Without this, Dynamo guards on the
+    # is_initialized Python bool by object id (___check_obj_id), the flag
+    # flips during cold's first forward, and the second call's prefill
+    # recompiles. cache_utils.py:302 documents this knob.
+    tc = model.config.get_text_config()
+    cache.early_initialization(
+        batch_size=1,
+        num_heads=tc.num_key_value_heads,
+        head_dim=tc.hidden_size // tc.num_attention_heads,
+        dtype=torch.bfloat16,
+        device=device,
+    )
 
     def run(ids, mask, max_new):
         cache.reset()
@@ -206,10 +215,14 @@ def _make_static_tensors_runner(model, tok, device, create_masks_for_generate):
     from transformers.generation.configuration_utils import GenerationConfig, CompileConfig
 
     cache = StaticCache(config=model.config, max_cache_len=DIY_MAX_CACHE_LEN)
-    for layer in cache.layers:
-        if hasattr(layer, "keys") and isinstance(layer.keys, torch.Tensor):
-            layer.keys = layer.keys.to(device)
-            layer.values = layer.values.to(device)
+    tc = model.config.get_text_config()
+    cache.early_initialization(
+        batch_size=1,
+        num_heads=tc.num_key_value_heads,
+        head_dim=tc.hidden_size // tc.num_attention_heads,
+        dtype=torch.bfloat16,
+        device=device,
+    )
 
     compile_config = CompileConfig(mode="default", fullgraph=False, dynamic=False)
     compiled_call = model.get_compiled_call(compile_config)
@@ -322,30 +335,28 @@ def orchestrate() -> None:
 
 
 def colorize_rows(rows: list[dict]) -> list[dict]:
-    """Add a 'color' field per row, computed against that mode's warm baseline.
+    """Add a 'color' field per row, based on Inductor artifact delta.
 
-    Thresholds are CUDA-tuned: Inductor compile costs seconds, not minutes
-    like Neuron NEFFs, so the absolute wallclock penalty of a recompile is
-    smaller — but a 2× warm cell is still a clearly visible TTFT spike,
-    not "partial reuse".
+    Previously the color was a wallclock-vs-warm ratio. That made sense when
+    `warm` carried ~13 s of one-shot late compile (since fixed by
+    `cache.early_initialization()` in the diy/static_tensors runners): then
+    a "fast" warm-diff cell was the giveaway that no recompile happened.
+    With warm now clean, more tokens just take more wallclock — ratio gets
+    confused by the workload size.
+
+    The +artifacts column is the unambiguous "did Inductor recompile"
+    signal: zero new artifacts means the cache absorbed the delta, any
+    positive count means a real recompile happened.
     """
-    by_mode: dict[str, dict[str, dict]] = {}
-    for r in rows:
-        by_mode.setdefault(r["mode"], {})[r["scenario"]] = r
     out = []
     for r in rows:
         scenario = r["scenario"]
         if scenario in ("cold", "warm"):
             color = ""
+        elif r["artifacts_delta"] == 0:
+            color = "🟢"
         else:
-            warm_total = by_mode[r["mode"]]["warm"]["total_s"]
-            ratio = r["total_s"] / warm_total if warm_total > 0 else float("inf")
-            if ratio <= 1.2:
-                color = "🟢"
-            elif ratio <= 1.5:
-                color = "🟡"
-            else:
-                color = "🔴"
+            color = "🔴"
         out.append({**r, "color": color})
     return out
 
