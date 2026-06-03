@@ -1,99 +1,151 @@
 # Generation loop on transformers + `torch.compile` — findings
 
 Scope: [SCOPE.md](SCOPE.md). One-process, batch-1 generation loop on
-transformers v5 with `cache_implementation="static"` + chunked
-prefill, no prefix caching.
+transformers v5 with chunked prefill, no prefix caching.
 
 Test bed: 1× NVIDIA A10G (23 GiB), bf16, torch 2.7.0+cu126,
-transformers 5.10.0.dev0 (upstream `main`), `Llama-3.2-1B-Instruct`.
+transformers 5.10.0.dev0 (upstream `main` at commit 595721c),
+`Llama-3.2-1B-Instruct`.
 
 ## TL;DR
 
-Recompile-free, low-variance steady-state TTFT (p99/p50 ≤ 1.02) is
-achievable today, but only if four behaviors are baked into the
-generate() calls. None of them surface in the public knobs.
+Three approaches to running `generate()` with `torch.compile` + chunked
+prefill, in ascending order of stability:
 
-1. **Pad inputs to a fixed bucket** that is a clean multiple of
-   `prefill_chunk_size`. Otherwise the tail chunk has a unique shape
-   and gets compiled on first occurrence.
-2. **Pin the StaticCache size yourself.** Construct
-   `StaticCache(config=..., max_cache_len=N)`, pass it via
-   `past_key_values=`, and *do not* set `cache_implementation`. The
-   built-in auto-cache reallocates the buffer whenever a later call
-   has a bigger `max_length`, which forces a recompile.
-3. **Warm the largest bucket first.** With the DIY cache, ordering
-   only matters for Inductor's shape set; warming the worst case
-   first means smaller buckets reuse those kernels.
-4. **Use `mode="default"`, not the library default `"reduce-overhead"`.**
-   `reduce-overhead` uses CUDA Graphs, which conflict with chunked
-   prefill. Among the two CUDA-Graphs-free options, `default` and
-   `max-autotune-no-cudagraphs` differ by 8–9 % TTFT — autotune wins,
-   but at 3× the warmup cost.
+1. **vanilla** — set `cache_implementation="static"` and call
+   `generate()`. Works for repeated identical calls. Silently recompiles
+   any time `max_length = max_new_tokens + input_ids_length` grows: a
+   longer prompt costs ~2.7× warm wallclock, a larger `max_new_tokens`
+   costs ~1.8×. The auto-allocated StaticCache is the root cause.
+2. **diy** — construct the StaticCache yourself sized for the worst
+   case, pass via `past_key_values=`, and *do not* set
+   `cache_implementation`. Recompile-free across both deltas. The
+   recipe.
+3. **static_tensors** — DIY cache *plus* pre-allocate the decode loop's
+   tensors (input_ids, position_ids, cache_position, 4D mask) and call
+   `model.get_compiled_call()` directly with manual argmax sampling.
+   Same cache properties as DIY, plus ~12 % higher steady-state tok/s
+   by skipping `generate()`'s Python plumbing.
 
-Separately: generate()'s Python decode loop carries ~1.1 ms/step of
-overhead from growing `input_ids`/`attention_mask`/`position_ids` —
-14–17 % of decode wallclock on a 1B model. Not a recompile on CUDA
-(unlike Neuron/TPU), but real allocator/dispatch cost. Shrinks
-proportionally as model size grows.
+See [scenario sweep](#scenario-sweep) for the data. Two findings sit
+outside the sweep:
 
-## Findings, with the script that proves each
+- **Cache over-provisioning costs decode tok/s.** Pinning a 1024-prompt
+  call to a cache sized 8192+128 halves decode throughput. See
+  [cache pinning vs over-provisioning](#cache-pinning-vs-over-provisioning).
+- **`generate()`'s Python decode loop costs ~1.1 ms / step on CUDA.**
+  ~14 % of wallclock on a 1B model. `static_tensors` removes it. See
+  [evidence/decode_overhead.py](evidence/decode_overhead.py).
 
-### Silent recompiles
+## Scenario sweep
 
-| # | Finding | Reproducer |
+Driven by [bench_scenarios.py](bench_scenarios.py). Raw output in
+[`logs/scenarios.tsv`](logs/scenarios.tsv); appendix in
+[results.md](results.md).
+
+### Config
+
+| Parameter | Value |
+|---|---|
+| model | `meta-llama/Llama-3.2-1B-Instruct` |
+| `max_seq_len` | 2048 |
+| `prefill_chunk_size` | 1024 |
+| short prompt | 1024 tokens (1 chunk) |
+| long prompt | 2048 tokens (2 chunks) |
+| `max_new_tokens` (default) | 128 |
+| `max_new_tokens` (warm-diff-mnt) | 256 |
+| DIY cache `max_cache_len` | 2304 |
+
+### Four scenarios
+
+- **cold** — empty Inductor cache. First call pays the full compile cost.
+- **warm** — same prompt + `max_new_tokens` as cold. Should be a clean
+  cache hit.
+- **warm-diff-mnt** — warm cache, same prompt, larger `max_new_tokens`.
+- **warm-diff-in** — warm cache, longer prompt.
+
+Each cell is `total_s / tps / +artifacts`. Color rates each warm-diff
+cell against the same mode's warm wallclock:
+
+- 🟢 ≤ 1.5× warm (essentially a cache hit)
+- 🟡 1.5–10× warm (partial reuse)
+- 🔴 > 10× warm (effectively a recompile)
+
+### Results
+
+| mode | cold | warm | warm-diff-mnt | warm-diff-in |
+|---|---|---|---|---|
+| vanilla        | 29.6 s / 4.3 tps / +56 | 14.9 s / 8.6 tps / +18 | 🟡 27.5 s / 9.3 tps / +21  | 🟡 40.5 s / 3.2 tps / +30 |
+| diy            | 29.3 s / 4.4 tps / +56 | 15.2 s / 8.4 tps / +18 | 🟢 2.7 s / 96.0 tps / +0   | 🟢 14.8 s / 8.6 tps / +0  |
+| static_tensors | 26.7 s / 4.8 tps / +56 | 13.6 s / 9.4 tps / +20 | 🟢 2.4 s / 107.2 tps / +0  | 🟢 13.2 s / 9.7 tps / +0  |
+
+### Takeaways
+
+1. **Vanilla is unstable across both deltas.** The auto-allocated
+   StaticCache uses `max_cache_len = max_new_tokens + input_length - 1`
+   as its key
+   ([generation/utils.py:2495](src/transformers/generation/utils.py#L2495))
+   — any change in either dimension forces a realloc and recompile. On
+   CUDA the absolute cost is 13–26 s per first occurrence (vs minutes
+   on Neuron, but the per-turn TTFT spike is still very visible in an
+   agent loop).
+2. **DIY rescues vanilla completely.** Construct the cache once at the
+   worst-case size, pass via `past_key_values=`, drop
+   `cache_implementation` (the two can't coexist —
+   [generation/utils.py:1822](src/transformers/generation/utils.py#L1822)).
+   The auto-compile criterion checks `cache.is_compileable`, not the
+   config field, so the compile path still kicks in.
+3. **`static_tensors` adds ~12 % decode tok/s on top of DIY** (107 vs 96
+   tps on warm-diff-mnt). The win is generate()'s Python overhead —
+   `torch.cat` of growing tensors plus the mask rebuild per step — that
+   the direct `compiled_call()` path skips. See
+   [evidence/decode_overhead.py](evidence/decode_overhead.py) for the
+   isolated microbenchmark; the relative win shrinks at larger model
+   sizes where decode is bandwidth-bound.
+4. **The first warm call adds ~18 artifacts in every mode.** A lazy
+   late compile inside `generate()` fires on the second call after
+   cold. It costs ~10–12 s wallclock and is mode-independent, so it
+   doesn't affect the diff measurements — they're rated against the
+   warm wallclock, which already includes the lazy cost.
+5. **Scenario order matters for vanilla.** `warm-diff-mnt` is run
+   before `warm-diff-in` so each delta forces a fresh cache realloc.
+   With the reverse order, `warm-diff-in` grows the auto-cache to 2175
+   slots and `warm-diff-mnt` (needing only 1279) silently hits the
+   larger cache — hiding the footgun. Diy and static_tensors are
+   order-independent because their cache is pre-sized.
+
+## Cache pinning vs over-provisioning
+
+Separate from the scenario sweep above. When a single process serves
+prompts of very different sizes (e.g. a 1024 bucket and an 8192 bucket),
+the StaticCache must be sized for the largest. The small-bucket calls
+then attend over a mostly-empty buffer:
+
+| 1024-bucket measurement | cache=1024+128 | cache=8192+128 |
 |---|---|---|
-| 1 | Tail chunk: `L % chunk_size ≠ 0` adds 25–31 Inductor artifacts and ~26 s per first-seen tail length. | [evidence/padding.py](evidence/padding.py) |
-| 2 | Cache realloc: `max_new_tokens` exceeding any seen-so-far reallocates the StaticCache and triggers a full ~15–30 s recompile silently. | [evidence/cache_realloc.py](evidence/cache_realloc.py) |
-| 2-fix | DIY-StaticCache (size once, pass as `past_key_values=`, drop `cache_implementation`) makes `max_new_tokens` free across calls. | [evidence/cache_realloc_fix.py](evidence/cache_realloc_fix.py) |
-| – | Cross-bucket dispatch is genuinely recompile-free after warmup: 20 random-bucket calls, 0 new artifacts, p99/p50 = 1.001. | [evidence/interleave_buckets.py](evidence/interleave_buckets.py) |
+| TTFT p50 (chunk=1024) | 47.7 ms | 76.2 ms (1.60× slower) |
+| decode tok/s | 115 | 52 (**2.2× slower**) |
 
-### Cheap wins
-
-1. **Warm largest bucket first.** With this order the four warmup
-   cells add 76 + 29 + 0 + 0 = 105 Inductor artifacts; the small-bucket
-   cells reuse the prefill kernels compiled at the large-bucket cache
-   size. Reverse-order warmup is inferred to ~double the artifacts;
-   we didn't quantify.
-2. **`prefill_chunk_size=1024` beats `chunk_size=512` by ~13 %** on
-   both buckets (76 vs 87 ms at 1024, 594 vs 676 ms at 8192). Fewer
-   kernel launches, no apparent downside at A10G memory levels.
-   Caveat: this is a *standard-causal-attention* result. Models with
-   sliding-window attention can flip the sign when `chunk_size` is
-   larger than the window — we did not measure this here.
-3. **Cache-pinning has a real decode cost on the small bucket.**
-   1024-prompt request with cache pinned at 8192+128 decodes at
-   52 tok/s; pinned at 1024+128 it decodes at 115 tok/s — **2.2×
-   slowdown** from over-provisioning. If prompt-length distribution is
-   bimodal, run two compiled processes, not one shared.
-4. **`mode="default"` is the production choice.** Autotune wins
-   8–9 % TTFT and 5 % decode at 3× the warmup wallclock (91 s vs 270 s
-   for four warmup cells). Worth considering only if the process
-   amortizes warmup over a very long-lived loop.
-5. **The generate()-loop convenience-tensor cost is ~1.1 ms/step on
-   CUDA** (~14–17 % of decode wallclock on a 1B model). Not a
-   recompile; just `torch.cat` of growing tensors + the rebuild of the
-   4D causal mask per step. Removing it (pre-allocate, fill in-place,
-   call the compiled forward directly) bought 127 → 149 tok/s.
-   See [evidence/decode_overhead.py](evidence/decode_overhead.py).
+Numbers from a separate run with a different config; not regenerated.
+The actionable rule: if prompt-length distribution is bimodal, run two
+compiled processes (one per bucket family), not one shared.
 
 ## Worth flagging upstream
 
 1. **`cache_implementation="static"` is a TTFT-bomb-shaped default.**
    The auto-cache reallocates on any `max_length` growth and there's
-   no documented escape. The DIY-StaticCache + `past_key_values=`
-   pattern works but conflicts with `cache_implementation` at runtime
-   ([generation/utils.py:1822](src/transformers/generation/utils.py#L1822)),
-   so users discover the conflict before discovering the workaround.
-   Two fixes: (a) doc note pointing to the DIY pattern under the
+   no documented escape. The DIY pattern works but conflicts with
+   `cache_implementation` at runtime
+   ([generation/utils.py:1822](src/transformers/generation/utils.py#L1822))
+   without prose explaining why a user might want either. Two fixes:
+   (a) doc note pointing to the DIY pattern under the
    `cache_implementation` docstring entry, or (b) honor
    `cache_config["max_cache_len"]` in `_prepare_static_cache` (3-line
    change).
 2. **`prefill_chunk_size` is undocumented public API.** Defined via
    `kwargs.pop` at
    [configuration_utils.py:465](src/transformers/generation/configuration_utils.py#L465)
-   and not mentioned in the class docstring. The user can only learn
-   about it by reading
-   [generation/utils.py:3766](src/transformers/generation/utils.py#L3766).
+   and absent from the class docstring.
 3. **No bucket-padding helper.** The whole point of buckets is
    recompile-free dispatch, and that requires exact-shape input. Every
    team using this pattern rolls their own pad-to-next-bucket loop.
@@ -103,20 +155,16 @@ proportionally as model size grows.
 - **Left-pad output quality**: not end-to-end tested. The bench uses
   random BOS-prefilled ids; before serving real traffic, verify that
   the model produces the same tokens with and without padding.
-- **`fullgraph=True` with sdpa**: not tested (`_can_compile_fullgraph`
-  is set on Llama).
-- **Hybrid / sliding-window attention models** (Gemma, Mistral
-  small-with-SWA, etc.): not measured in this iteration. Anecdotally,
-  `prefill_chunk_size > sliding_window` is known to interact poorly
-  with kernel choice on those models, but we have no fresh data.
-- **Batch > 1**: out of scope — multi-request batching is
-  `generate_batch`'s problem.
-- **Attention-mask shape variation within a fixed bucket**: not
-  tested. The recipe pads, so the 2D mask shape is fixed.
-- **Decode tok/s** is measured from a single full-decode call per
-  cell, not averaged, so cross-cell decode comparisons within ~5–10 %
-  should be taken with a grain of salt. The TTFT numbers are from
-  N=10 calls per cell and are tight.
+- **`fullgraph=True` with sdpa**: not tested.
+- **Hybrid / sliding-window attention models** (Gemma, Mistral-SWA,
+  etc.): not measured in this iteration. `prefill_chunk_size >
+  sliding_window` is anecdotally known to interact poorly with kernel
+  choice on those models, but we have no fresh data.
+- **Compile mode (`default` vs `max-autotune-no-cudagraphs`)**: not
+  varied in the scenario bench. A separate run on Llama-1B showed
+  autotune buys ~8–9 % TTFT for 3× the warmup wallclock; `default` is
+  the right production default.
+- **Batch > 1** is out of scope.
 
 ## Reproduce
 
@@ -127,18 +175,29 @@ uv pip install --python .venv/bin/python torch==2.7.0 \
 uv pip install --python .venv/bin/python -e /path/to/transformers accelerate
 ```
 
-Then run any of the standalone evidence scripts (each is
-self-contained and prints its result to stdout), or [bench.py](bench.py)
-for the full warmup + steady-state sweep:
+Then run the scenario sweep (orchestrator spawns one subprocess per
+mode, each with a fresh Inductor cache):
 
 ```sh
-CUDA_VISIBLE_DEVICES=0 .venv/bin/python bench.py \
-    --model-id meta-llama/Llama-3.2-1B-Instruct --mode default \
-    --input-lens 1024 8192 --chunk-sizes 512 1024 \
-    --steady-calls 10 --decode-sanity-tokens 128 \
-    --cache-root /tmp/inductor-bench --run-tag llama
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python bench_scenarios.py
 ```
 
-Every script reads its own purpose from the first ten lines of its
-file. Sweep JSON outputs and per-cell warmup logs are in `logs/`;
-see [results.md](results.md) for the full per-cell numbers.
+Or run a single mode directly (used internally by the orchestrator):
+
+```sh
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python bench_scenarios.py --mode diy
+```
+
+The three orthogonal evidence scripts in [evidence/](evidence/) each
+test a separate question and print results to stdout:
+
+- [`padding.py`](evidence/padding.py) — tail-chunk shape recompile
+  (input length must be a multiple of `prefill_chunk_size`).
+- [`interleave_buckets.py`](evidence/interleave_buckets.py) —
+  cross-bucket dispatch survives a random-order loop with zero
+  recompiles.
+- [`decode_overhead.py`](evidence/decode_overhead.py) — isolated
+  measurement of generate()'s Python loop overhead vs a direct
+  compiled-forward loop.
+
+Every script reads its purpose from the first ~10 lines of its file.
