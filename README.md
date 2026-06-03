@@ -78,9 +78,11 @@ Driven by [bench_scenarios.py](bench_scenarios.py). Raw output in
 - **warm-diff-in** — warm cache, longer prompt.
 
 Each cell is `total_s / tps / +artifacts`. Color is on the +artifacts
-column alone — the unambiguous "did anything recompile" signal:
+column alone — the unambiguous "did anything recompile" signal.
+Applied to every cell except `cold` (which is the compile baseline
+and would always be 🔴 by definition):
 
-- 🟢 +0 artifacts (cache absorbed the delta cleanly)
+- 🟢 +0 artifacts (cache absorbed; no Inductor compile fired)
 - 🔴 +artifacts > 0 (real Inductor recompile)
 
 Wallclock ratios stopped being a useful color basis once the diy /
@@ -92,9 +94,9 @@ context.
 
 | mode | cold | warm | warm-diff-mnt | warm-diff-in |
 |---|---|---|---|---|
-| vanilla        | 29.7 s / 4.3 tps / +56 | 14.9 s / 8.6 tps / +18 | 🔴 27.6 s / 9.3 tps / +21  | 🔴 40.8 s / 3.1 tps / +30 |
-| diy            | 28.9 s / 4.4 tps / +54 |  1.4 s / 95.0 tps / +0 | 🟢 2.6 s / 96.6 tps / +0   | 🟢 14.7 s / 8.7 tps / +0  |
-| static_tensors | 26.6 s / 4.8 tps / +54 |  1.2 s / 105.1 tps / +0 | 🟢 2.4 s / 107.2 tps / +0 | 🟢 13.6 s / 9.4 tps / +0  |
+| vanilla        | 29.7 s / 4.3 tps / +56 | 🔴 14.9 s / 8.6 tps / +18 | 🔴 27.6 s / 9.3 tps / +21  | 🔴 40.8 s / 3.1 tps / +30 |
+| diy            | 28.9 s / 4.4 tps / +54 | 🟢  1.4 s / 95.0 tps / +0 | 🟢  2.6 s / 96.6 tps / +0  | 🟢 14.7 s / 8.7 tps / +0  |
+| static_tensors | 26.6 s / 4.8 tps / +54 | 🟢  1.2 s / 105.1 tps / +0 | 🟢  2.4 s / 107.2 tps / +0 | 🟢 13.6 s / 9.4 tps / +0  |
 
 ### Takeaways
 

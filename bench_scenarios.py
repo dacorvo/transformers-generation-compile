@@ -351,7 +351,10 @@ def colorize_rows(rows: list[dict]) -> list[dict]:
     out = []
     for r in rows:
         scenario = r["scenario"]
-        if scenario in ("cold", "warm"):
+        # `cold` is the compile baseline — always has artifacts, coloring it
+        # would be meaningless. Every other cell (warm + warm-diff-*) is rated
+        # on its artifact delta.
+        if scenario == "cold":
             color = ""
         elif r["artifacts_delta"] == 0:
             color = "🟢"

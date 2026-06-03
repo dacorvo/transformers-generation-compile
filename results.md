@@ -19,22 +19,24 @@ this fix.
 | mode           | scenario        | total_s | tps    | +artifacts | color |
 |----------------|-----------------|--------:|-------:|-----------:|-------|
 | vanilla        | cold            |   29.66 |   4.32 |         56 |       |
-| vanilla        | warm            |   14.90 |   8.59 |         18 |       |
+| vanilla        | warm            |   14.90 |   8.59 |         18 | 🔴    |
 | vanilla        | warm-diff-mnt   |   27.55 |   9.29 |         21 | 🔴    |
 | vanilla        | warm-diff-in    |   40.75 |   3.14 |         30 | 🔴    |
 | diy            | cold            |   28.86 |   4.44 |         54 |       |
-| diy            | warm            |    1.35 |  94.99 |          0 |       |
+| diy            | warm            |    1.35 |  94.99 |          0 | 🟢    |
 | diy            | warm-diff-mnt   |    2.65 |  96.59 |          0 | 🟢    |
 | diy            | warm-diff-in    |   14.70 |   8.71 |          0 | 🟢    |
 | static_tensors | cold            |   26.60 |   4.81 |         54 |       |
-| static_tensors | warm            |    1.22 | 105.07 |          0 |       |
+| static_tensors | warm            |    1.22 | 105.07 |          0 | 🟢    |
 | static_tensors | warm-diff-mnt   |    2.39 | 107.25 |          0 | 🟢    |
 | static_tensors | warm-diff-in    |   13.60 |   9.41 |          0 | 🟢    |
 
 `+artifacts` counts new Inductor artifact files (`.cubin` / `.so` /
 `.kernel.json`) added during the cell. A non-zero count means a real
 Inductor recompile happened; zero means the cache absorbed the delta.
-Color is on this column alone (🟢 = +0, 🔴 = +>0).
+Color is on this column alone (🟢 = +0, 🔴 = +>0). `cold` is left
+uncolored — it's the baseline first-time compile and would always be
+🔴 by definition.
 
 Note on `diy / warm-diff-in` and `static_tensors / warm-diff-in`:
 +0 artifacts but ~14 s wallclock. The cache absorbed the delta (no
