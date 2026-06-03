@@ -5,7 +5,15 @@ transformers v5 with chunked prefill, no prefix caching.
 
 Test bed: 1× NVIDIA A10G (23 GiB), bf16, torch 2.7.0+cu126,
 transformers 5.10.0.dev0 (upstream `main` at commit 595721c),
-`Llama-3.2-1B-Instruct`.
+`Llama-3.2-1B-Instruct` only. Gemma-4-E4B was in SCOPE.md but was
+dropped during simplification; the hybrid / sliding-window open
+question therefore stays open (see caveats).
+
+Each scenario cell below is a single timed call (N=1). SCOPE asked
+for N≥10 with TTFT variance; the new bench traded that for
+side-by-side mode comparison. Treat the warm-diff rows as "this
+delta does/doesn't recompile" indicators, not as steady-state
+performance numbers.
 
 ## TL;DR
 
@@ -19,13 +27,15 @@ prefill, in ascending order of stability:
    costs ~1.8×. The auto-allocated StaticCache is the root cause.
 2. **diy** — construct the StaticCache yourself sized for the worst
    case, pass via `past_key_values=`, and *do not* set
-   `cache_implementation`. Recompile-free across both deltas. The
-   recipe.
+   `cache_implementation`. On the single call tested per warm-diff
+   cell, no new Inductor artifacts and ratio ≤ 1.0× warm. The
+   provisional recipe.
 3. **static_tensors** — DIY cache *plus* pre-allocate the decode loop's
    tensors (input_ids, position_ids, cache_position, 4D mask) and call
    `model.get_compiled_call()` directly with manual argmax sampling.
-   Same cache properties as DIY, plus ~12 % higher steady-state tok/s
-   by skipping `generate()`'s Python plumbing.
+   Same cache behavior as DIY in the one-shot test, plus ~12 % higher
+   tok/s on warm-diff-mnt by skipping `generate()`'s Python plumbing
+   (single-call number, single config).
 
 See [scenario sweep](#scenario-sweep) for the data. Two findings sit
 outside the sweep:
@@ -92,12 +102,15 @@ visible TTFT spike, not "partial reuse"):
    firmly 🔴 by CUDA standards. The absolute cost is 12–25 s per first
    occurrence (vs minutes on Neuron), and that's the per-turn TTFT
    spike an agent would see.
-2. **DIY rescues vanilla completely.** Construct the cache once at the
-   worst-case size, pass via `past_key_values=`, drop
-   `cache_implementation` (the two can't coexist —
+2. **DIY absorbs both deltas in the one-shot test.** Construct the
+   cache once at the worst-case size, pass via `past_key_values=`,
+   drop `cache_implementation` (the two can't coexist —
    [generation/utils.py:1822](src/transformers/generation/utils.py#L1822)).
    The auto-compile criterion checks `cache.is_compileable`, not the
-   config field, so the compile path still kicks in.
+   config field, so the compile path still kicks in. The bench shows
+   0 new artifacts and ≤ 1.0× warm wallclock on both warm-diff cells
+   — but each cell is a single timed call, so this is "no recompile
+   on this delta" rather than a 10-call steady-state validation.
 3. **`static_tensors` adds ~12 % decode tok/s on top of DIY** (107 vs 96
    tps on warm-diff-mnt). The win is generate()'s Python overhead —
    `torch.cat` of growing tensors plus the mask rebuild per step — that
