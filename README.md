@@ -65,19 +65,21 @@ Driven by [bench_scenarios.py](bench_scenarios.py). Raw output in
 - **warm-diff-in** — warm cache, longer prompt.
 
 Each cell is `total_s / tps / +artifacts`. Color rates each warm-diff
-cell against the same mode's warm wallclock:
+cell against the same mode's warm wallclock. Thresholds are CUDA-tuned
+(Inductor compile is fast enough that even 2× warm is a clearly
+visible TTFT spike, not "partial reuse"):
 
-- 🟢 ≤ 1.5× warm (essentially a cache hit)
-- 🟡 1.5–10× warm (partial reuse)
-- 🔴 > 10× warm (effectively a recompile)
+- 🟢 ≤ 1.2× warm (essentially a cache hit)
+- 🟡 1.2–1.5× warm (some absorption, but visible)
+- 🔴 > 1.5× warm (effectively a recompile)
 
 ### Results
 
 | mode | cold | warm | warm-diff-mnt | warm-diff-in |
 |---|---|---|---|---|
-| vanilla        | 29.6 s / 4.3 tps / +56 | 14.9 s / 8.6 tps / +18 | 🟡 27.5 s / 9.3 tps / +21  | 🟡 40.5 s / 3.2 tps / +30 |
-| diy            | 29.3 s / 4.4 tps / +56 | 15.2 s / 8.4 tps / +18 | 🟢 2.7 s / 96.0 tps / +0   | 🟢 14.8 s / 8.6 tps / +0  |
-| static_tensors | 26.7 s / 4.8 tps / +56 | 13.6 s / 9.4 tps / +20 | 🟢 2.4 s / 107.2 tps / +0  | 🟢 13.2 s / 9.7 tps / +0  |
+| vanilla        | 29.0 s / 4.4 tps / +56 | 14.6 s / 8.8 tps / +18 | 🔴 26.9 s / 9.5 tps / +21  | 🔴 39.8 s / 3.2 tps / +30 |
+| diy            | 29.2 s / 4.4 tps / +56 | 15.1 s / 8.5 tps / +18 | 🟢 2.7 s / 96.2 tps / +0   | 🟢 14.6 s / 8.8 tps / +0  |
+| static_tensors | 26.9 s / 4.8 tps / +56 | 14.0 s / 9.1 tps / +20 | 🟢 2.4 s / 107.2 tps / +0  | 🟢 13.5 s / 9.5 tps / +0  |
 
 ### Takeaways
 
@@ -85,10 +87,11 @@ cell against the same mode's warm wallclock:
    StaticCache uses `max_cache_len = max_new_tokens + input_length - 1`
    as its key
    ([generation/utils.py:2495](src/transformers/generation/utils.py#L2495))
-   — any change in either dimension forces a realloc and recompile. On
-   CUDA the absolute cost is 13–26 s per first occurrence (vs minutes
-   on Neuron, but the per-turn TTFT spike is still very visible in an
-   agent loop).
+   — any change in either dimension forces a realloc and recompile.
+   warm-diff-mnt sits at 1.8× warm, warm-diff-in at 2.7× warm — both
+   firmly 🔴 by CUDA standards. The absolute cost is 12–25 s per first
+   occurrence (vs minutes on Neuron), and that's the per-turn TTFT
+   spike an agent would see.
 2. **DIY rescues vanilla completely.** Construct the cache once at the
    worst-case size, pass via `past_key_values=`, drop
    `cache_implementation` (the two can't coexist —

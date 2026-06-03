@@ -322,7 +322,13 @@ def orchestrate() -> None:
 
 
 def colorize_rows(rows: list[dict]) -> list[dict]:
-    """Add a 'color' field per row, computed against that mode's warm baseline."""
+    """Add a 'color' field per row, computed against that mode's warm baseline.
+
+    Thresholds are CUDA-tuned: Inductor compile costs seconds, not minutes
+    like Neuron NEFFs, so the absolute wallclock penalty of a recompile is
+    smaller — but a 2× warm cell is still a clearly visible TTFT spike,
+    not "partial reuse".
+    """
     by_mode: dict[str, dict[str, dict]] = {}
     for r in rows:
         by_mode.setdefault(r["mode"], {})[r["scenario"]] = r
@@ -334,9 +340,9 @@ def colorize_rows(rows: list[dict]) -> list[dict]:
         else:
             warm_total = by_mode[r["mode"]]["warm"]["total_s"]
             ratio = r["total_s"] / warm_total if warm_total > 0 else float("inf")
-            if ratio <= 1.5:
+            if ratio <= 1.2:
                 color = "🟢"
-            elif ratio <= 10.0:
+            elif ratio <= 1.5:
                 color = "🟡"
             else:
                 color = "🔴"

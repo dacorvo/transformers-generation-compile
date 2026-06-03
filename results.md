@@ -13,25 +13,28 @@ mode subprocess and writes the final table to
 
 | mode           | scenario        | total_s | tps    | +artifacts | color |
 |----------------|-----------------|--------:|-------:|-----------:|-------|
-| vanilla        | cold            |   29.58 |   4.33 |         56 |       |
-| vanilla        | warm            |   14.89 |   8.59 |         18 |       |
-| vanilla        | warm-diff-mnt   |   27.46 |   9.32 |         21 | 🟡    |
-| vanilla        | warm-diff-in    |   40.50 |   3.16 |         30 | 🟡    |
-| diy            | cold            |   29.31 |   4.37 |         56 |       |
-| diy            | warm            |   15.22 |   8.41 |         18 |       |
-| diy            | warm-diff-mnt   |    2.67 |  96.00 |          0 | 🟢    |
-| diy            | warm-diff-in    |   14.84 |   8.62 |          0 | 🟢    |
-| static_tensors | cold            |   26.66 |   4.80 |         56 |       |
-| static_tensors | warm            |   13.64 |   9.38 |         20 |       |
-| static_tensors | warm-diff-mnt   |    2.39 | 107.25 |          0 | 🟢    |
-| static_tensors | warm-diff-in    |   13.20 |   9.70 |          0 | 🟢    |
+| vanilla        | cold            |   28.99 |   4.41 |         56 |       |
+| vanilla        | warm            |   14.58 |   8.78 |         18 |       |
+| vanilla        | warm-diff-mnt   |   26.87 |   9.53 |         21 | 🔴    |
+| vanilla        | warm-diff-in    |   39.76 |   3.22 |         30 | 🔴    |
+| diy            | cold            |   29.17 |   4.39 |         56 |       |
+| diy            | warm            |   15.05 |   8.51 |         18 |       |
+| diy            | warm-diff-mnt   |    2.66 |  96.23 |          0 | 🟢    |
+| diy            | warm-diff-in    |   14.57 |   8.78 |          0 | 🟢    |
+| static_tensors | cold            |   26.91 |   4.76 |         56 |       |
+| static_tensors | warm            |   14.00 |   9.14 |         20 |       |
+| static_tensors | warm-diff-mnt   |    2.39 | 107.21 |          0 | 🟢    |
+| static_tensors | warm-diff-in    |   13.48 |   9.49 |          0 | 🟢    |
 
 `+artifacts` counts new Inductor artifact files (`.cubin` / `.so` /
 `.kernel.json`) added during the cell. A non-zero count in a warm-diff
 row means a real recompile happened.
 
-Color is computed against the same mode's `warm` total_s:
-🟢 ≤ 1.5×, 🟡 1.5–10×, 🔴 > 10×.
+Color is computed against the same mode's `warm` total_s, with
+CUDA-tuned thresholds: 🟢 ≤ 1.2×, 🟡 1.2–1.5×, 🔴 > 1.5×. Looser
+Neuron-style thresholds (≤1.5 / 1.5–10 / >10) would call the vanilla
+deltas "partial reuse"; on CUDA they're real recompiles that add
+12–25 s of latency per first occurrence.
 
 ## Decode-loop overhead microbenchmark
 
