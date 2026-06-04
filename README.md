@@ -108,17 +108,6 @@ wallclock even with no recompile.
    plumbing — `torch.cat` of growing tensors and the per-step mask
    rebuild — that direct `compiled_call()` skips. Isolated
    microbenchmark: [evidence/decode_overhead.py](evidence/decode_overhead.py).
-4. **`diy / warm-diff-in` is slow with +0 artifacts.** 14.7 s
-   wallclock, no new Inductor compile — Dynamo likely re-traces the
-   outer prefill graph for the new `input_ids` shape (1, 2048) and
-   hits the FX-graph cache for the per-chunk (1, 1024) kernel.
-   Tracing time paid, codegen time not. The cache-absorption claim
-   stands.
-5. **Scenario order matters for vanilla.** `warm-diff-mnt` runs
-   before `warm-diff-in` so each delta forces a fresh realloc.
-   Reversed, `warm-diff-in`'s bigger cache absorbs `warm-diff-mnt`
-   and hides the footgun. DIY/static_tensors are order-independent
-   (cache pre-sized).
 
 ## Worth flagging upstream
 
