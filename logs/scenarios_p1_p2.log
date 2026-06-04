@@ -1,0 +1,53 @@
+
+=== launching vanilla ===
+[vanilla] loading model...
+[vanilla/cold] total=29.59s  tps=4.33  artifacts+=56
+[vanilla/warm] total=14.97s  tps=8.55  artifacts+=18
+[vanilla/warm-diff-mnt] total=28.33s  tps=9.04  artifacts+=21
+[vanilla/warm-diff-in] total=41.18s  tps=3.11  artifacts+=30
+
+=== launching vanilla_p1 ===
+[vanilla_p1] loading model...
+[vanilla_p1/cold] total=28.68s  tps=4.46  artifacts+=54
+[vanilla_p1/warm] total=1.15s  tps=111.25  artifacts+=0
+[vanilla_p1/warm-diff-mnt] total=27.01s  tps=9.48  artifacts+=19
+[vanilla_p1/warm-diff-in] total=26.36s  tps=4.86  artifacts+=19
+
+=== launching vanilla_p2 ===
+[vanilla_p2] loading model...
+[vanilla_p2/cold] total=29.31s  tps=4.37  artifacts+=56
+[vanilla_p2/warm] total=14.85s  tps=8.62  artifacts+=18
+[vanilla_p2/warm-diff-mnt] total=2.66s  tps=96.15  artifacts+=0
+[vanilla_p2/warm-diff-in] total=14.44s  tps=8.87  artifacts+=0
+
+=== launching vanilla_p1_p2 ===
+[vanilla_p1_p2] loading model...
+[vanilla_p1_p2/cold] total=28.94s  tps=4.42  artifacts+=54
+[vanilla_p1_p2/warm] total=1.35s  tps=94.77  artifacts+=0
+[vanilla_p1_p2/warm-diff-mnt] total=2.66s  tps=96.41  artifacts+=0
+[vanilla_p1_p2/warm-diff-in] total=14.51s  tps=8.82  artifacts+=0
+
+=== launching diy ===
+[diy] loading model...
+[diy/cold] total=28.77s  tps=4.45  artifacts+=54
+[diy/warm] total=1.35s  tps=94.88  artifacts+=0
+[diy/warm-diff-mnt] total=2.65s  tps=96.44  artifacts+=0
+[diy/warm-diff-in] total=14.36s  tps=8.91  artifacts+=0
+
+=== launching static_tensors ===
+[static_tensors] loading model...
+[static_tensors/cold] total=26.87s  tps=4.76  artifacts+=54
+[static_tensors/warm] total=1.22s  tps=105.04  artifacts+=0
+[static_tensors/warm-diff-mnt] total=2.39s  tps=107.21  artifacts+=0
+[static_tensors/warm-diff-in] total=13.46s  tps=9.51  artifacts+=0
+
+mode             |          cold          |          warm          |     warm-diff-mnt      |      warm-diff-in     
+--------------------------------------------------------------------------------------------------------------------
+vanilla          |   29.6s/4.3tps/+56a    |  🔴 15.0s/8.6tps/+18a   |  🔴 28.3s/9.0tps/+21a   |  🔴 41.2s/3.1tps/+30a  
+vanilla_p1       |   28.7s/4.5tps/+54a    |  🟢 1.1s/111.2tps/+0a   |  🔴 27.0s/9.5tps/+19a   |  🔴 26.4s/4.9tps/+19a  
+vanilla_p2       |   29.3s/4.4tps/+56a    |  🔴 14.8s/8.6tps/+18a   |   🟢 2.7s/96.2tps/+0a   |   🟢 14.4s/8.9tps/+0a  
+vanilla_p1_p2    |   28.9s/4.4tps/+54a    |   🟢 1.4s/94.8tps/+0a   |   🟢 2.7s/96.4tps/+0a   |   🟢 14.5s/8.8tps/+0a  
+diy              |   28.8s/4.5tps/+54a    |   🟢 1.4s/94.9tps/+0a   |   🟢 2.6s/96.4tps/+0a   |   🟢 14.4s/8.9tps/+0a  
+static_tensors   |   26.9s/4.8tps/+54a    |  🟢 1.2s/105.0tps/+0a   |  🟢 2.4s/107.2tps/+0a   |   🟢 13.5s/9.5tps/+0a  
+
+[wrote logs/scenarios.tsv]

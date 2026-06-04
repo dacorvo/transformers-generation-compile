@@ -47,11 +47,11 @@ SHORT_PROMPT_LEN = 1024
 LONG_PROMPT_LEN = 2048
 MAX_NEW_DEFAULT = 128
 MAX_NEW_BIG = 256
-# DIY cache must cover both warm-diff cells.
-DIY_MAX_CACHE_LEN = max(LONG_PROMPT_LEN + MAX_NEW_DEFAULT,
-                        SHORT_PROMPT_LEN + MAX_NEW_BIG) + 64  # 64 slack
+# Cache must cover both warm-diff cells.
+MAX_CACHE_LEN = max(LONG_PROMPT_LEN + MAX_NEW_DEFAULT,
+                    SHORT_PROMPT_LEN + MAX_NEW_BIG) + 64  # 64 slack
 
-MODES = ("vanilla", "vanilla_patched", "diy", "static_tensors")
+MODES = ("vanilla", "vanilla_p1", "vanilla_p2", "vanilla_p1_p2", "diy", "static_tensors")
 # Order matters for `vanilla`: its auto-cache grows monotonically, so running
 # warm-diff-mnt before warm-diff-in ensures BOTH deltas force a realloc
 # (otherwise warm-diff-in's bigger total cache would absorb warm-diff-mnt).
@@ -114,9 +114,13 @@ def run_mode(mode: str) -> list[dict]:
 
     # Mode-specific runners. Each returns wallclock for one call.
     if mode == "vanilla":
-        run_call = _make_vanilla_runner(model, tok)
-    elif mode == "vanilla_patched":
-        run_call = _make_vanilla_patched_runner(model, tok)
+        run_call = _make_vanilla_runner(model, tok, apply_p1=False, apply_p2=False)
+    elif mode == "vanilla_p1":
+        run_call = _make_vanilla_runner(model, tok, apply_p1=True,  apply_p2=False)
+    elif mode == "vanilla_p2":
+        run_call = _make_vanilla_runner(model, tok, apply_p1=False, apply_p2=True)
+    elif mode == "vanilla_p1_p2":
+        run_call = _make_vanilla_runner(model, tok, apply_p1=True,  apply_p2=True)
     elif mode == "diy":
         run_call = _make_diy_runner(model, tok, device)
     elif mode == "static_tensors":
@@ -149,62 +153,71 @@ def run_mode(mode: str) -> list[dict]:
     return rows
 
 
-def _make_vanilla_runner(model, tok):
-    import torch
-    from transformers.generation.configuration_utils import GenerationConfig, CompileConfig
+def _apply_monkey_patches(apply_p1: bool, apply_p2: bool) -> None:
+    """Install runtime patches on `GenerationMixin` corresponding to the two
+    proposed upstream fixes. Each patch is no-op when its flag is False.
 
-    def run(ids, mask, max_new):
-        cfg = GenerationConfig(
-            do_sample=False,
-            cache_implementation="static",
-            compile_config=CompileConfig(mode="default", fullgraph=False, dynamic=False),
-            max_new_tokens=max_new, min_new_tokens=max_new,
-            prefill_chunk_size=PREFILL_CHUNK,
-            pad_token_id=tok.eos_token_id,
-        )
-        torch.cuda.synchronize(); t = time.perf_counter()
-        model.generate(input_ids=ids, attention_mask=mask, generation_config=cfg)
-        torch.cuda.synchronize()
-        return time.perf_counter() - t
-
-    return run
-
-
-def _make_vanilla_patched_runner(model, tok):
-    """Same as vanilla, but monkey-patches `GenerationMixin._prepare_static_cache`
-    so the freshly-allocated `StaticCache` has `early_initialization(...)` called
-    on it before being returned. Demonstrates the proposed upstream fix
-    (https://github.com/huggingface/transformers/issues/<TBD>) on stock
-    transformers 5.10.1 without touching the source tree."""
-    import torch
+    p1 — auto-call `cache.early_initialization(...)` from
+         `_prepare_static_cache` so the lazy-init branch in `update` never
+         fires inside a compiled region. Fixes the chunked-prefill recompile
+         described in [ISSUE_DRAFT.md](ISSUE_DRAFT.md).
+    p2 — honor `generation_config.cache_config["max_cache_len"]` on the static
+         path of `_prepare_cache_for_generation`. Today the static branch only
+         derives `max_cache_len` from `max_length - 1`; `cache_config` is read
+         on the quantized branch only, so a user setting it gets it silently
+         ignored (verified in evidence/cache_config_max_cache_len.py).
+    """
     from transformers import StaticCache
-    from transformers.generation.utils import GenerationMixin
+    from transformers.generation.utils import GenerationMixin, ALL_STATIC_CACHE_IMPLEMENTATIONS
+
+    if apply_p1:
+        _orig_static = GenerationMixin._prepare_static_cache
+
+        def _patched_static(self, cache_implementation, batch_size, max_cache_len, model_kwargs):
+            cache = _orig_static(self, cache_implementation, batch_size, max_cache_len, model_kwargs)
+            layers = getattr(cache, "layers", None)
+            if isinstance(cache, StaticCache) and layers and not getattr(layers[0], "is_initialized", False):
+                tc = self.config.get_text_config(decoder=True)
+                cache.early_initialization(
+                    batch_size=batch_size,
+                    num_heads=tc.num_key_value_heads,
+                    head_dim=tc.hidden_size // tc.num_attention_heads,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+            return cache
+
+        GenerationMixin._prepare_static_cache = _patched_static
+
+    if apply_p2:
+        _orig_prep = GenerationMixin._prepare_cache_for_generation
+
+        def _patched_prep(self, generation_config, model_kwargs, generation_mode, batch_size, max_cache_length):
+            cc = generation_config.cache_config or {}
+            if (
+                "max_cache_len" in cc
+                and generation_config.cache_implementation in ALL_STATIC_CACHE_IMPLEMENTATIONS
+            ):
+                max_cache_length = max(max_cache_length, cc["max_cache_len"])
+            return _orig_prep(self, generation_config, model_kwargs, generation_mode, batch_size, max_cache_length)
+
+        GenerationMixin._prepare_cache_for_generation = _patched_prep
+
+
+def _make_vanilla_runner(model, tok, *, apply_p1: bool, apply_p2: bool):
+    """`cache_implementation="static"` driven by GenerationConfig only. With
+    `apply_p1` / `apply_p2`, runtime monkey patches simulate the two proposed
+    upstream fixes — see `_apply_monkey_patches` for what each one does."""
+    import torch
     from transformers.generation.configuration_utils import GenerationConfig, CompileConfig
 
-    _orig_prep = GenerationMixin._prepare_static_cache
-
-    def patched(self, cache_implementation, batch_size, max_cache_len, model_kwargs):
-        cache = _orig_prep(self, cache_implementation, batch_size, max_cache_len, model_kwargs)
-        # Only fire if the cache is a static cache whose layers haven't been initialized yet
-        # (e.g. it was freshly allocated rather than being a reused cache from a prior call).
-        layers = getattr(cache, "layers", None)
-        if isinstance(cache, StaticCache) and layers and not getattr(layers[0], "is_initialized", False):
-            tc = self.config.get_text_config(decoder=True)
-            cache.early_initialization(
-                batch_size=batch_size,
-                num_heads=tc.num_key_value_heads,
-                head_dim=tc.hidden_size // tc.num_attention_heads,
-                dtype=self.dtype,
-                device=self.device,
-            )
-        return cache
-
-    GenerationMixin._prepare_static_cache = patched
+    _apply_monkey_patches(apply_p1=apply_p1, apply_p2=apply_p2)
 
     def run(ids, mask, max_new):
         cfg = GenerationConfig(
             do_sample=False,
             cache_implementation="static",
+            cache_config={"max_cache_len": MAX_CACHE_LEN},
             compile_config=CompileConfig(mode="default", fullgraph=False, dynamic=False),
             max_new_tokens=max_new, min_new_tokens=max_new,
             prefill_chunk_size=PREFILL_CHUNK,
@@ -223,7 +236,7 @@ def _make_diy_runner(model, tok, device):
     from transformers import StaticCache
     from transformers.generation.configuration_utils import GenerationConfig, CompileConfig
 
-    cache = StaticCache(config=model.config, max_cache_len=DIY_MAX_CACHE_LEN)
+    cache = StaticCache(config=model.config, max_cache_len=MAX_CACHE_LEN)
     # Pre-fire the cache layers' `is_initialized` flag and allocate the K/V
     # tensors BEFORE Dynamo traces. Without this, Dynamo guards on the
     # is_initialized Python bool by object id (___check_obj_id), the flag
@@ -264,7 +277,7 @@ def _make_static_tensors_runner(model, tok, device, create_masks_for_generate):
     from transformers import StaticCache
     from transformers.generation.configuration_utils import GenerationConfig, CompileConfig
 
-    cache = StaticCache(config=model.config, max_cache_len=DIY_MAX_CACHE_LEN)
+    cache = StaticCache(config=model.config, max_cache_len=MAX_CACHE_LEN)
     tc = model.config.get_text_config()
     cache.early_initialization(
         batch_size=1,
@@ -294,7 +307,7 @@ def _make_static_tensors_runner(model, tok, device, create_masks_for_generate):
     def run(ids, mask, max_new):
         cache.reset()
         prompt_len = ids.shape[1]
-        cache_len = cache.max_cache_len  # always DIY_MAX_CACHE_LEN
+        cache_len = cache.max_cache_len  # always MAX_CACHE_LEN
 
         torch.cuda.synchronize(); t = time.perf_counter()
 

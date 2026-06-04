@@ -82,21 +82,32 @@ wallclock even with no recompile.
 
 ### Results
 
-| mode             | cold | warm | warm-diff-mnt | warm-diff-in |
+| mode            | cold | warm | warm-diff-mnt | warm-diff-in |
 |---|---|---|---|---|
-| vanilla          | 29.7 s / 4.3 tps / +56 | 🔴 14.9 s / 8.6 tps / +18  | 🔴 27.8 s / 9.2 tps / +21 | 🔴 41.8 s / 3.1 tps / +30 |
-| vanilla_patched  | 29.1 s / 4.4 tps / +54 | 🟢  1.2 s / 111.2 tps / +0 | 🔴 27.5 s / 9.3 tps / +19 | 🔴 27.1 s / 4.7 tps / +19 |
-| diy              | 29.1 s / 4.4 tps / +54 | 🟢  1.4 s / 94.7 tps / +0  | 🟢  2.7 s / 96.3 tps / +0 | 🟢 14.6 s / 8.7 tps / +0  |
-| static_tensors   | 26.7 s / 4.8 tps / +54 | 🟢  1.2 s / 105.0 tps / +0 | 🟢  2.4 s / 107.2 tps / +0 | 🟢 13.4 s / 9.6 tps / +0  |
+| vanilla         | 29.6 s / 4.3 tps / +56 | 🔴 15.0 s / 8.6 tps / +18  | 🔴 28.3 s / 9.0 tps / +21 | 🔴 41.2 s / 3.1 tps / +30 |
+| vanilla_p1      | 28.7 s / 4.5 tps / +54 | 🟢  1.1 s / 111.2 tps / +0 | 🔴 27.0 s / 9.5 tps / +19 | 🔴 26.4 s / 4.9 tps / +19 |
+| vanilla_p2      | 29.3 s / 4.4 tps / +56 | 🔴 14.8 s / 8.6 tps / +18  | 🟢  2.7 s / 96.2 tps / +0 | 🟢 14.4 s / 8.9 tps / +0  |
+| vanilla_p1_p2   | 28.9 s / 4.4 tps / +54 | 🟢  1.4 s / 94.8 tps / +0  | 🟢  2.7 s / 96.4 tps / +0 | 🟢 14.5 s / 8.8 tps / +0  |
+| diy             | 28.8 s / 4.5 tps / +54 | 🟢  1.4 s / 94.9 tps / +0  | 🟢  2.6 s / 96.4 tps / +0 | 🟢 14.4 s / 8.9 tps / +0  |
+| static_tensors  | 26.9 s / 4.8 tps / +54 | 🟢  1.2 s / 105.0 tps / +0 | 🟢  2.4 s / 107.2 tps / +0 | 🟢 13.5 s / 9.5 tps / +0  |
 
-`vanilla_patched` is stock 5.10.1 with a runtime monkey patch on
-`GenerationMixin._prepare_static_cache` that auto-calls
-`cache.early_initialization(...)` — the proposed upstream fix (see
-[ISSUE_DRAFT.md](ISSUE_DRAFT.md)). The fix is scoped exactly to `warm`:
-the lazy-init recompile is gone (+0 artifacts), but `warm-diff-*` still
-trigger a `StaticCache` realloc + recompile because `max_cache_len` grew.
-DIY pre-sizes the cache to the worst case, sidestepping that second
-issue.
+The four `vanilla*` rows are an ablation across two proposed upstream
+fixes, each applied as a runtime monkey patch on stock 5.10.1
+(`_apply_monkey_patches` in [bench_scenarios.py](bench_scenarios.py)):
+
+- **p1** — auto-call `cache.early_initialization(...)` from
+  `_prepare_static_cache`. Defuses the lazy-init recompile (see
+  [ISSUE_DRAFT.md](ISSUE_DRAFT.md)). Visible effect: `warm` clears.
+- **p2** — honor `generation_config.cache_config["max_cache_len"]` on the
+  static path of `_prepare_cache_for_generation` (the `GenerationConfig`
+  docstring implies it's honored, but it is silently ignored — verified
+  in [evidence/cache_config_max_cache_len.py](evidence/cache_config_max_cache_len.py)).
+  Visible effect: `warm-diff-mnt` and `warm-diff-in` clear because the
+  cache no longer reallocates when `max_length` grows.
+
+`vanilla_p1_p2` recovers DIY-equivalent behavior without the user
+constructing a `StaticCache` themselves. The two fixes are orthogonal:
+neither alone clears all three warm cells, and both together do.
 
 ### Takeaways
 
