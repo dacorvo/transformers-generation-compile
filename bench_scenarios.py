@@ -51,7 +51,7 @@ MAX_NEW_BIG = 256
 DIY_MAX_CACHE_LEN = max(LONG_PROMPT_LEN + MAX_NEW_DEFAULT,
                         SHORT_PROMPT_LEN + MAX_NEW_BIG) + 64  # 64 slack
 
-MODES = ("vanilla", "diy", "static_tensors")
+MODES = ("vanilla", "vanilla_patched", "diy", "static_tensors")
 # Order matters for `vanilla`: its auto-cache grows monotonically, so running
 # warm-diff-mnt before warm-diff-in ensures BOTH deltas force a realloc
 # (otherwise warm-diff-in's bigger total cache would absorb warm-diff-mnt).
@@ -115,6 +115,8 @@ def run_mode(mode: str) -> list[dict]:
     # Mode-specific runners. Each returns wallclock for one call.
     if mode == "vanilla":
         run_call = _make_vanilla_runner(model, tok)
+    elif mode == "vanilla_patched":
+        run_call = _make_vanilla_patched_runner(model, tok)
     elif mode == "diy":
         run_call = _make_diy_runner(model, tok, device)
     elif mode == "static_tensors":
@@ -150,6 +152,54 @@ def run_mode(mode: str) -> list[dict]:
 def _make_vanilla_runner(model, tok):
     import torch
     from transformers.generation.configuration_utils import GenerationConfig, CompileConfig
+
+    def run(ids, mask, max_new):
+        cfg = GenerationConfig(
+            do_sample=False,
+            cache_implementation="static",
+            compile_config=CompileConfig(mode="default", fullgraph=False, dynamic=False),
+            max_new_tokens=max_new, min_new_tokens=max_new,
+            prefill_chunk_size=PREFILL_CHUNK,
+            pad_token_id=tok.eos_token_id,
+        )
+        torch.cuda.synchronize(); t = time.perf_counter()
+        model.generate(input_ids=ids, attention_mask=mask, generation_config=cfg)
+        torch.cuda.synchronize()
+        return time.perf_counter() - t
+
+    return run
+
+
+def _make_vanilla_patched_runner(model, tok):
+    """Same as vanilla, but monkey-patches `GenerationMixin._prepare_static_cache`
+    so the freshly-allocated `StaticCache` has `early_initialization(...)` called
+    on it before being returned. Demonstrates the proposed upstream fix
+    (https://github.com/huggingface/transformers/issues/<TBD>) on stock
+    transformers 5.10.1 without touching the source tree."""
+    import torch
+    from transformers import StaticCache
+    from transformers.generation.utils import GenerationMixin
+    from transformers.generation.configuration_utils import GenerationConfig, CompileConfig
+
+    _orig_prep = GenerationMixin._prepare_static_cache
+
+    def patched(self, cache_implementation, batch_size, max_cache_len, model_kwargs):
+        cache = _orig_prep(self, cache_implementation, batch_size, max_cache_len, model_kwargs)
+        # Only fire if the cache is a static cache whose layers haven't been initialized yet
+        # (e.g. it was freshly allocated rather than being a reused cache from a prior call).
+        layers = getattr(cache, "layers", None)
+        if isinstance(cache, StaticCache) and layers and not getattr(layers[0], "is_initialized", False):
+            tc = self.config.get_text_config(decoder=True)
+            cache.early_initialization(
+                batch_size=batch_size,
+                num_heads=tc.num_key_value_heads,
+                head_dim=tc.hidden_size // tc.num_attention_heads,
+                dtype=self.dtype,
+                device=self.device,
+            )
+        return cache
+
+    GenerationMixin._prepare_static_cache = patched
 
     def run(ids, mask, max_new):
         cfg = GenerationConfig(

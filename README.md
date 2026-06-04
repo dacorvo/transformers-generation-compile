@@ -82,11 +82,21 @@ wallclock even with no recompile.
 
 ### Results
 
-| mode | cold | warm | warm-diff-mnt | warm-diff-in |
+| mode             | cold | warm | warm-diff-mnt | warm-diff-in |
 |---|---|---|---|---|
-| vanilla        | 29.7 s / 4.3 tps / +56 | 🔴 14.9 s / 8.6 tps / +18 | 🔴 27.6 s / 9.3 tps / +21  | 🔴 40.8 s / 3.1 tps / +30 |
-| diy            | 28.9 s / 4.4 tps / +54 | 🟢  1.4 s / 95.0 tps / +0 | 🟢  2.6 s / 96.6 tps / +0  | 🟢 14.7 s / 8.7 tps / +0  |
-| static_tensors | 26.6 s / 4.8 tps / +54 | 🟢  1.2 s / 105.1 tps / +0 | 🟢  2.4 s / 107.2 tps / +0 | 🟢 13.6 s / 9.4 tps / +0  |
+| vanilla          | 29.7 s / 4.3 tps / +56 | 🔴 14.9 s / 8.6 tps / +18  | 🔴 27.8 s / 9.2 tps / +21 | 🔴 41.8 s / 3.1 tps / +30 |
+| vanilla_patched  | 29.1 s / 4.4 tps / +54 | 🟢  1.2 s / 111.2 tps / +0 | 🔴 27.5 s / 9.3 tps / +19 | 🔴 27.1 s / 4.7 tps / +19 |
+| diy              | 29.1 s / 4.4 tps / +54 | 🟢  1.4 s / 94.7 tps / +0  | 🟢  2.7 s / 96.3 tps / +0 | 🟢 14.6 s / 8.7 tps / +0  |
+| static_tensors   | 26.7 s / 4.8 tps / +54 | 🟢  1.2 s / 105.0 tps / +0 | 🟢  2.4 s / 107.2 tps / +0 | 🟢 13.4 s / 9.6 tps / +0  |
+
+`vanilla_patched` is stock 5.10.1 with a runtime monkey patch on
+`GenerationMixin._prepare_static_cache` that auto-calls
+`cache.early_initialization(...)` — the proposed upstream fix (see
+[ISSUE_DRAFT.md](ISSUE_DRAFT.md)). The fix is scoped exactly to `warm`:
+the lazy-init recompile is gone (+0 artifacts), but `warm-diff-*` still
+trigger a `StaticCache` realloc + recompile because `max_cache_len` grew.
+DIY pre-sizes the cache to the worst case, sidestepping that second
+issue.
 
 ### Takeaways
 

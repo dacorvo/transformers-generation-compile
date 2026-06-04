@@ -1,0 +1,17 @@
+mode	scenario	total_s	tps	artifacts_delta	color
+vanilla	cold	29.65	4.32	56	
+vanilla	warm	14.93	8.57	18	🔴
+vanilla	warm-diff-mnt	27.8	9.21	21	🔴
+vanilla	warm-diff-in	41.78	3.06	30	🔴
+vanilla_patched	cold	29.14	4.39	54	
+vanilla_patched	warm	1.15	111.16	0	🟢
+vanilla_patched	warm-diff-mnt	27.51	9.31	19	🔴
+vanilla_patched	warm-diff-in	27.09	4.73	19	🔴
+diy	cold	29.09	4.4	54	
+diy	warm	1.35	94.66	0	🟢
+diy	warm-diff-mnt	2.66	96.31	0	🟢
+diy	warm-diff-in	14.64	8.74	0	🟢
+static_tensors	cold	26.68	4.8	54	
+static_tensors	warm	1.22	105.04	0	🟢
+static_tensors	warm-diff-mnt	2.39	107.2	0	🟢
+static_tensors	warm-diff-in	13.41	9.55	0	🟢
