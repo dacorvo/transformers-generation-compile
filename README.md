@@ -108,7 +108,7 @@ wallclock even with no recompile.
 
 ## Worth flagging upstream
 
-**`cache_implementation="static"` conflicts with DIY cache if both are set **
+**`cache_implementation="static"` conflicts with DIY cache if both are set**
 
 ## Reproduce
 
