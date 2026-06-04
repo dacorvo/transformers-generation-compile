@@ -24,11 +24,12 @@ prefill, in ascending order of stability:
    costs ~1.8×. The auto-allocated StaticCache is the root cause.
 2. **diy** — construct the StaticCache yourself sized for the worst
    case, call `cache.early_initialization(...)` *once* before the
-   first generate() (otherwise you eat ~13 s on the second call from a
-   Dynamo guard miss on `is_initialized` — see takeaway #2), pass the
-   cache via `past_key_values=`, and *do not* set
-   `cache_implementation`. Both warm-diff cells absorb cleanly:
-   +0 new Inductor artifacts. The provisional recipe.
+   first generate() (mandatory whenever the prefill itself is compiled —
+   which `prefill_chunk_size` triggers; otherwise the second call eats
+   ~13 s retracing — see takeaway #2), pass the cache via
+   `past_key_values=`, and *do not* set `cache_implementation`. Both
+   warm-diff cells absorb cleanly: +0 new Inductor artifacts. The
+   provisional recipe.
 3. **static_tensors** — DIY cache (with the same `early_initialization`
    step) *plus* pre-allocate the decode loop's tensors (input_ids,
    position_ids, cache_position, 4D mask) and call
@@ -94,13 +95,22 @@ wallclock even with no recompile.
    any growth in either dimension forces a realloc. Both warm-diff
    cells add 21–30 artifacts and 13–26 s of wallclock — the per-turn
    TTFT spike an agent sees.
-2. **Warm's recompile happens when `CacheLayerMixin.is_initialized` changes.**
-   The flag is a Python bool that flips False → True during the
-   first prefill's `lazy_initialization`, but this means Dynamo sees it as
-   a modified object on the second prefill, which triggers a retrace of all its methods.
-   Fix: call `cache.early_initialization(...)` before the first generate()
-   in this bench it collapses warm from 15 s / +18 to 1.4 s / +0.
-4. **`static_tensors` buys ~12 % decode tok/s over DIY** (107 vs 96
+2. **Chunked prefill + any static cache: `is_initialized` is a Dynamo
+   footgun.** With `prefill_chunk_size` set, `generate()` compiles the
+   prefill (via `model.get_compiled_call()` per chunk). The first chunk
+   traces with `is_initialized=False`; `lazy_initialization` then flips
+   it to `True`. On the next call Dynamo's `___check_obj_id` guard on
+   that Python bool fails (`id(False) != id(True)`) and the prefill
+   re-traces. Affects every static-cache flavour we tested
+   (auto-allocated by `cache_implementation="static"` or DIY-constructed
+   and passed via `past_key_values=`). It does *not*
+   happen with unchunked prefill — there the flip happens in eager code
+   that no compiled graph guards on (verified in
+   [evidence/unchunked_no_early_init.py](evidence/unchunked_no_early_init.py):
+   cold → warm shows +0 artifacts without any `early_initialization`
+   call). Fix: call `cache.early_initialization(...)` before the first
+   generate() — collapses warm from 15 s / +18 to 1.4 s / +0.
+3. **`static_tensors` buys ~12 % decode tok/s over DIY** (107 vs 96
    tps on warm-diff-mnt). The win is `generate()`'s Python decode
    plumbing — `torch.cat` of growing tensors and the per-step mask
    rebuild — that direct `compiled_call()` skips. Isolated
