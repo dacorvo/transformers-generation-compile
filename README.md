@@ -94,16 +94,13 @@ wallclock even with no recompile.
    any growth in either dimension forces a realloc. Both warm-diff
    cells add 21–30 artifacts and 13–26 s of wallclock — the per-turn
    TTFT spike an agent sees.
-2. **Warm's recompile is a Dynamo guard miss on `is_initialized`.**
+2. **Warm's recompile happens when `CacheLayerMixin.is_initialized` changes.**
    The flag is a Python bool that flips False → True during the
-   first prefill's `lazy_initialization`
-   Dynamo's `___check_obj_id` guard fails on the second call (True
-   is a different object than the original False), so the prefill
-   graph re-traces. `cache.reset()` doesn't restore the original
-   object. Fix: call `cache.early_initialization(...)` before the
-   first generate()
+   first prefill's `lazy_initialization`, but this means Dynamo sees it as
+   a modified object on the second prefill, which triggers a retrace of all its methods.
+   Fix: call `cache.early_initialization(...)` before the first generate()
    in this bench it collapses warm from 15 s / +18 to 1.4 s / +0.
-3. **`static_tensors` buys ~12 % decode tok/s over DIY** (107 vs 96
+4. **`static_tensors` buys ~12 % decode tok/s over DIY** (107 vs 96
    tps on warm-diff-mnt). The win is `generate()`'s Python decode
    plumbing — `torch.cat` of growing tensors and the per-step mask
    rebuild — that direct `compiled_call()` skips. Isolated
@@ -111,12 +108,7 @@ wallclock even with no recompile.
 
 ## Worth flagging upstream
 
-Verified against transformers v5.10.1.
-
-1. **`cache_implementation="static"` reallocates on any `max_length`
-   growth** and has no documented escape. The DIY workaround conflicts
-   with `cache_implementation` at runtime
-2. **`CacheLayerMixin.is_initialized` is Dynamo-guarded by object id**
+**`cache_implementation="static"` conflicts with DIY cache if both are set **
 
 ## Reproduce
 
